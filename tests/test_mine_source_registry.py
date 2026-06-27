@@ -120,3 +120,43 @@ def test_mine_help_documents_source_as_the_extension_path():
     out = _run_mine("--help")
     assert out.returncode == 0
     assert "--source" in out.stdout and "RFC 002" in out.stdout
+def test_run_mine_source_adapter_via_daemon_path(tmp_dir, palace_path, _fake_adapter):
+    """The daemon path: ``run_mine`` routes a ``source_adapter`` payload through the registry
+    (the same core the CLI runs), so ``mine --source NAME --daemon`` files verbatim through the
+    write-daemon's single palace handle."""
+    from mempalace.palace import get_collection
+    from mempalace.service import run_mine
+
+    res = run_mine(
+        {
+            "source_adapter": "fake-test",
+            "source": tmp_dir,
+            "palace_path": palace_path,
+        }
+    )
+    assert res["success"] is True
+    assert res["filed"] == 1
+    assert res["source"] == "fake-test"
+
+    col = get_collection(palace_path, create=True)
+    got = col.get(where={"source_file": "fake://item/1"})
+    assert got["documents"] == ["the operator said the verb leads"]
+    assert got["metadatas"][0]["lar_demo"] == "1"  # adapter-authored metadata lands verbatim
+
+
+def test_run_mine_source_adapter_dry_run_files_nothing(tmp_dir, palace_path, _fake_adapter):
+    from mempalace.palace import get_collection
+    from mempalace.service import run_mine
+
+    res = run_mine(
+        {
+            "source_adapter": "fake-test",
+            "source": tmp_dir,
+            "dry_run": True,
+            "palace_path": palace_path,
+        }
+    )
+    assert res["success"] is True
+
+    col = get_collection(palace_path, create=True)
+    assert col.get(where={"source_file": "fake://item/1"})["ids"] == []
