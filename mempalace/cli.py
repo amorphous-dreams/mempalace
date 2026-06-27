@@ -545,66 +545,27 @@ def _mine_via_source_adapter(args, palace_path):
     migrated onto the contract (§9 cleanup), so the registry path stays opt-in
     and changes no existing behavior. This wires the registry the spec reserves.
     """
-    from .knowledge_graph import KnowledgeGraph
-    from .palace import MineAlreadyRunning, get_collection, mine_palace_lock
-    from .sources.base import DrawerRecord, SourceItemMetadata, SourceRef
-    from .sources.context import PalaceContext
-    from .sources.registry import get_adapter, resolve_adapter_for_source
+    from .palace import MineAlreadyRunning
+    from .service import mine_via_source_adapter
 
-    name = resolve_adapter_for_source(explicit=args.source)
     try:
-        adapter = get_adapter(name)
+        res = mine_via_source_adapter(
+            source_name=args.source,
+            source_dir=args.dir,
+            wing=getattr(args, "wing", None),
+            dry_run=bool(args.dry_run),
+            palace_path=palace_path,
+        )
     except KeyError as exc:
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(2)
-
-    # Routing precedence (§2.5): explicit --wing flows to the adapter via
-    # SourceRef.options; the adapter honors it. Secrets never go here (§2.2).
-    options = {}
-    if getattr(args, "wing", None):
-        options["wing"] = args.wing
-    ref = SourceRef(local_path=os.path.abspath(os.path.expanduser(args.dir)), options=options)
-
-    filed = 0
-    skipped = 0
-    try:
-        with mine_palace_lock(palace_path):
-            collection = get_collection(palace_path, create=True)
-            kg = KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3"))
-            ctx = PalaceContext(
-                drawer_collection=collection,
-                knowledge_graph=kg,
-                palace_path=palace_path,
-                config=MempalaceConfig(),
-                adapter_name=getattr(adapter, "name", name),
-                adapter_version=getattr(adapter, "adapter_version", ""),
-            )
-
-            skip_item = False
-            for result in adapter.ingest(source=ref, palace=ctx):
-                if isinstance(result, SourceItemMetadata):
-                    skip_item = False
-                    ctx._skip_requested = False
-                    existing = collection.get(where={"source_file": result.source_file}, limit=1)
-                    metas = (existing or {}).get("metadatas") or []
-                    if adapter.is_current(item=result, existing_metadata=metas[0] if metas else None):
-                        ctx.skip_current_item()
-                        skip_item = True
-                elif isinstance(result, DrawerRecord):
-                    if skip_item or ctx._skip_requested:
-                        skipped += 1
-                        continue
-                    if not args.dry_run:
-                        ctx.upsert_drawer(result)
-                    filed += 1
-            adapter.close()
     except MineAlreadyRunning as exc:
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
 
     verb = "Would file" if args.dry_run else "Drawers filed:"
-    tail = f"  (skipped {skipped} up-to-date)" if skipped else ""
-    print(f"  source={name}  {verb} {filed}{tail}")
+    tail = f"  (skipped {res['skipped']} up-to-date)" if res["skipped"] else ""
+    print(f"  source={res['name']}  {verb} {res['filed']}{tail}")
 
 
 def cmd_mine(args):
@@ -617,13 +578,12 @@ def cmd_mine(args):
         print("mempalace: --background requires --daemon", file=sys.stderr)
         sys.exit(2)
 
-    if getattr(args, "source", None) and getattr(args, "daemon", False):
-        print("mempalace: --source does not support --daemon yet", file=sys.stderr)
-        sys.exit(2)
-
     if getattr(args, "daemon", False):
         payload = {
             "source": args.dir,
+            # source_adapter (the `--source NAME`) routes the daemon job through the RFC 002
+            # registry (run_mine's source branch), serialized against the single palace handle.
+            "source_adapter": getattr(args, "source", None),
             "mode": args.mode,
             "wing": args.wing,
             "agent": args.agent,
