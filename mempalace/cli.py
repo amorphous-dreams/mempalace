@@ -32,6 +32,7 @@ Examples:
 import os
 import sys
 import shlex
+import time
 import argparse
 from pathlib import Path
 
@@ -757,6 +758,79 @@ def _mine_via_source_adapter(args, palace_path):
     print(f"  source={name}  {verb} {filed}{tail}")
 
 
+def _mine_lock_wait_budget() -> float:
+    """Total seconds a direct ``mempalace mine`` waits out lock contention.
+
+    Defaults to 30s; override with ``MEMPALACE_MINE_LOCK_WAIT`` (``0`` keeps
+    the old fail-fast behaviour, with a clean give-up message).
+    """
+    raw = os.environ.get("MEMPALACE_MINE_LOCK_WAIT", "30")
+    try:
+        budget = float(raw)
+    except (TypeError, ValueError):
+        return 30.0
+    return budget if budget >= 0 else 30.0
+
+
+def _mine_with_lock_backoff(attempt, *, max_wait: float | None = None):
+    """Run ``attempt`` (a no-arg mine callable); on ``MineAlreadyRunning``
+    quietly retry with bounded exponential backoff instead of spamming the
+    holder message on every contention.
+
+    The palace single-writer lock (``mine_palace_lock``) is intentionally
+    non-blocking and raises ``MineAlreadyRunning`` so in-process callers can
+    bail; a *harvest* of back-to-back ``mempalace mine`` runs against a
+    palace a daemon already holds therefore printed the same
+    "held by PID … wait for it to finish" line over and over. This collapses
+    that to ONE notice plus a backoff (matching the deadline-loop idiom used
+    by the daemon stale-takeover and the closet_llm retry), bounds the wait,
+    then gives up cleanly. Behaviour is unchanged otherwise: it eventually
+    mines (lock frees) or exits non-zero (budget spent) — never spins
+    forever, never spams.
+
+    Returns ``attempt()``'s value on success. Raises ``SystemExit(1)`` once
+    the wait budget is exhausted. Any non-lock exception (e.g.
+    ``MineValidationError``) propagates to the caller unchanged.
+    """
+    from .palace import MineAlreadyRunning
+
+    budget = _mine_lock_wait_budget() if max_wait is None else max_wait
+    deadline = time.monotonic() + budget
+    delay = 0.5
+    announced = False
+    last_exc: "MineAlreadyRunning | None" = None
+
+    while True:
+        try:
+            return attempt()
+        except MineAlreadyRunning as exc:
+            last_exc = exc
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if not announced:
+                # One notice for the whole contention window — the per-attempt
+                # holder line is otherwise identical and only adds noise.
+                print(
+                    f"mempalace: {exc}\n"
+                    f"  waiting up to {budget:.0f}s for the writer to finish "
+                    "(quiet retry with backoff)...",
+                    file=sys.stderr,
+                )
+                announced = True
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 5.0)
+
+    detail = f"mempalace: {last_exc}\n  " if last_exc else "mempalace: "
+    print(
+        f"{detail}palace still held after {budget:.0f}s; giving up. "
+        "Re-run with --daemon to queue the mine, or retry once the writer "
+        "finishes.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     include_ignored = []
@@ -816,9 +890,9 @@ def cmd_mine(args):
         _mine_via_source_adapter(args, palace_path)
         return
 
-    from .palace import MineAlreadyRunning, MineValidationError
+    from .palace import MineValidationError
 
-    try:
+    def _attempt():
         if args.mode == "convos":
             from .convo_miner import mine_convos
 
@@ -856,13 +930,16 @@ def cmd_mine(args):
                 include_ignored=include_ignored,
                 max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
             )
-    except MineAlreadyRunning as exc:
-        # A live MCP server or another mine is already writing to this
-        # palace. Surface the holder identity so the operator knows what
-        # to wait for (or stop), and exit non-zero so wrappers like
-        # nohup / scripts can detect the contention.
-        print(f"mempalace: {exc}", file=sys.stderr)
-        sys.exit(1)
+
+    try:
+        # A live MCP server, daemon, or another mine may already hold the
+        # palace single-writer lock. _mine_with_lock_backoff absorbs that
+        # contention with a quiet bounded retry (one notice + backoff) and
+        # exits non-zero only after the wait budget is spent — replacing the
+        # old fail-fast path that spammed the holder line once per harvest
+        # step. MineValidationError (raised after a successful mine) still
+        # propagates here.
+        _mine_with_lock_backoff(_attempt)
     except MineValidationError as exc:
         # PRAGMA quick_check on chroma.sqlite3 returned errors at end of mine.
         # The corruption may pre-date the mine; we surface it here so automation
@@ -1724,6 +1801,8 @@ def cmd_repair(args):
         ):
             return
 
+        from .palace import MineAlreadyRunning
+
         try:
             counts = rebuild_from_sqlite(
                 source_palace=source_path,
@@ -1731,6 +1810,17 @@ def cmd_repair(args):
                 archive_existing_dest=archive_existing,
                 dry_run=dry_run,
             )
+        except MineAlreadyRunning as exc:
+            # The single-writer lock is held (live MCP server, daemon, or
+            # another mine). rebuild_from_sqlite takes the lock BEFORE the
+            # archive/rename, so the palace is UNTOUCHED here — no archive,
+            # no partial dest. Surface the holder and exit non-zero.
+            print(
+                f"\n  mempalace: {exc}\n"
+                "  The palace was left untouched (no archive, no partial rebuild).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         except RebuildPartialError as exc:
             # The error itself was already printed by rebuild_from_sqlite
             # with recovery instructions; surface a non-zero exit so
