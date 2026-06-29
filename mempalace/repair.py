@@ -1245,6 +1245,43 @@ def rebuild_from_sqlite(
             )
             return {}
 
+    # Acquire the single-writer mine-lock BEFORE the archive/rename. The
+    # rebuild upserts into ``dest_palace`` through the same backend write
+    # path that takes ``mine_palace_lock`` per batch; if a daemon or a
+    # concurrent mine already holds it, those upserts used to fail *after*
+    # ``shutil.move`` had already stranded the existing palace aside
+    # (renamed to ``.pre-rebuild-…`` with no rebuilt replacement, leaving a
+    # partial/archived mess). Taking the lock up front makes contention
+    # fail CLEAN — no archive, no partial dest, the palace left untouched —
+    # and runs the whole rebuild as one writer (the inner per-batch
+    # acquires pass through re-entrantly on this thread).
+    from .palace import mine_palace_lock
+
+    with mine_palace_lock(dest_palace):
+        return _rebuild_from_sqlite_locked(
+            source_palace=source_palace,
+            dest_palace=dest_palace,
+            in_place=in_place,
+            batch_size=batch_size,
+        )
+
+
+def _rebuild_from_sqlite_locked(
+    *,
+    source_palace: str,
+    dest_palace: str,
+    in_place: bool,
+    batch_size: int,
+) -> dict[str, int]:
+    """Body of :func:`rebuild_from_sqlite`, run while holding
+    ``mine_palace_lock(dest_palace)`` so the archive/rename and the
+    upserts form one atomic single-writer operation.
+
+    Split out so the lock acquired in :func:`rebuild_from_sqlite` wraps
+    every destructive step (the archive ``shutil.move`` below included).
+    Raising :class:`MineAlreadyRunning` from the wrapping ``with`` happens
+    before this body runs, so a held lock never reaches the archive.
+    """
     archive_path: Optional[str] = None
     if in_place:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1252,7 +1289,6 @@ def rebuild_from_sqlite(
         print(f"  Archiving {dest_palace} → {archive_path}")
         shutil.move(dest_palace, archive_path)
         source_palace = archive_path
-        src_db = os.path.join(source_palace, "chroma.sqlite3")
 
         # In-place only: drop chromadb's process-wide System registry so
         # the new client at dest_palace builds a fresh System. Without
