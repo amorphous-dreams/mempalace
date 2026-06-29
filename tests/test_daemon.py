@@ -836,6 +836,155 @@ def test_run_mcp_tool_marks_bare_error_dict_as_failure(monkeypatch):
     assert out["exit_code"] == 0
 
 
+# --- singleton-per-palace + idle-reap regressions ---
+
+
+@pytest.mark.skipif(
+    daemon._fcntl is None,
+    reason="serve.lock singleton relies on POSIX fcntl.flock",
+)
+def test_second_serve_refuses_when_palace_already_served(tmp_path, monkeypatch):
+    """The lifetime serve.lock makes 'one serve per palace' an OS-enforced
+    invariant: a second run_server for a palace that already has a live serve
+    must return immediately WITHOUT binding a second port or overwriting
+    endpoint.json — no inter-serve queue war, no pile-up."""
+    client, thread, palace, holders = _start_server(
+        tmp_path, monkeypatch, lambda k, p: {"success": True}
+    )
+    try:
+        endpoint_before = daemon.endpoint_path(str(palace)).read_text(encoding="utf-8")
+
+        # Capture any second HTTP bind that would happen if the flock failed to
+        # gate the duplicate. A refusing serve returns before defining _Server.
+        second_holders = _capture_httpd(monkeypatch)
+        result: dict = {}
+
+        def _serve2():
+            result["ret"] = daemon.run_server(palace_path=str(palace), port=0)
+
+        t2 = threading.Thread(target=_serve2, name="second-serve", daemon=True)
+        t2.start()
+        t2.join(timeout=5)
+
+        assert not t2.is_alive(), "second serve blocked in serve_forever instead of refusing"
+        assert result.get("ret") is None
+        # No second server was ever bound.
+        assert second_holders == [], "a duplicate HTTP server was bound for the same palace"
+        # endpoint.json still points at the first serve, untouched.
+        assert (
+            daemon.endpoint_path(str(palace)).read_text(encoding="utf-8") == endpoint_before
+        )
+        # The original serve is still healthy.
+        assert client.health()["ok"] is True
+    finally:
+        _stop_server(client, thread, holders)
+
+
+def test_idle_reap_shuts_down_after_ttl(tmp_path, monkeypatch):
+    """A serve with a tiny idle TTL and no jobs reaps itself: the worker trips
+    the TTL, returns from serve_forever, and _drain_and_cleanup removes the
+    endpoint. Bounds orphan accumulation."""
+    monkeypatch.setenv(daemon.IDLE_TTL_ENV, "1.0")
+    client, thread, palace, holders = _start_server(
+        tmp_path, monkeypatch, lambda k, p: {"success": True}
+    )
+    try:
+        # No jobs submitted — the worker must self-reap within the TTL window.
+        thread.join(timeout=15)
+        assert not thread.is_alive(), "idle daemon did not self-reap within the TTL window"
+        # _drain_and_cleanup unlinks endpoint.json + pid on the way out.
+        assert not daemon.endpoint_path(str(palace)).exists()
+        assert not daemon.pid_path(str(palace)).exists()
+    finally:
+        if thread.is_alive():
+            _stop_server(client, thread, holders)
+
+
+def test_idle_reap_opts_out_when_ttl_zero(tmp_path, monkeypatch):
+    """TTL <= 0 opts out: the serve stays up across the idle window."""
+    monkeypatch.setenv(daemon.IDLE_TTL_ENV, "0")
+    client, thread, palace, holders = _start_server(
+        tmp_path, monkeypatch, lambda k, p: {"success": True}
+    )
+    try:
+        time.sleep(1.0)
+        assert thread.is_alive(), "serve reaped itself despite TTL=0 (opt-out)"
+        assert client.health()["ok"] is True
+    finally:
+        _stop_server(client, thread, holders)
+
+
+def test_reap_stale_serve_sigterms_only_clearly_stale_live_pid(tmp_path, monkeypatch):
+    """The conservative takeover: SIGTERM a recorded serve only when its /health
+    is dead, its pid is alive, and it has been up past the stale threshold.
+    A fresh (recently started) serve is never killed."""
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    sd = daemon.state_dir(str(palace))
+    sd.mkdir(parents=True, exist_ok=True)
+
+    killed: list = []
+    monkeypatch.setattr(daemon, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(daemon.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    # Don't actually wait for the (fake) pid to die.
+    monkeypatch.setattr(daemon.time, "sleep", lambda *a, **kw: None)
+
+    def _write_endpoint(started_at):
+        daemon.endpoint_path(str(palace)).write_text(
+            __import__("json").dumps(
+                {"host": "127.0.0.1", "port": 1, "pid": 999999, "started_at": started_at}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    # Stale serve (older than the threshold) → SIGTERM'd.
+    stale = (
+        datetime.now(timezone.utc) - timedelta(seconds=daemon.STALE_TAKEOVER_SECONDS + 10)
+    ).isoformat()
+    _write_endpoint(stale)
+    daemon._reap_stale_serve(str(palace))
+    assert killed == [(999999, daemon.signal.SIGTERM)]
+
+    # Fresh serve (just started) → left alone.
+    killed.clear()
+    _write_endpoint(datetime.now(timezone.utc).isoformat())
+    daemon._reap_stale_serve(str(palace))
+    assert killed == []
+
+
+def test_reap_stale_serve_leaves_dead_pid_alone(tmp_path, monkeypatch):
+    """A recorded serve whose pid is already dead is not SIGTERM'd — nothing to
+    take over."""
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    sd = daemon.state_dir(str(palace))
+    sd.mkdir(parents=True, exist_ok=True)
+
+    killed: list = []
+    monkeypatch.setattr(daemon, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(daemon.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    stale = (
+        datetime.now(timezone.utc) - timedelta(seconds=daemon.STALE_TAKEOVER_SECONDS + 10)
+    ).isoformat()
+    daemon.endpoint_path(str(palace)).write_text(
+        __import__("json").dumps(
+            {"host": "127.0.0.1", "port": 1, "pid": 999999, "started_at": stale}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    daemon._reap_stale_serve(str(palace))
+    assert killed == []
+
+
 def test_get_client_if_running_uses_short_probe_timeout(monkeypatch):
     """The hook liveness precheck must pass a short health timeout so a wedged
     daemon can't stall the hook past its budget (Copilot review)."""

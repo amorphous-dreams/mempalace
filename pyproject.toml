@@ -27,7 +27,13 @@ classifiers = [
     "Topic :: Utilities",
 ]
 dependencies = [
-    "chromadb>=1.5.4,<2",
+    # Pinned exact: the HNSW-segment heuristics (link/data ratio quarantine,
+    # index_metadata.pickle sniffing, sync_threshold divergence guard) and the
+    # caller-supplied-vector / multi-collection seam are all verified against
+    # chromadb 1.5.9 specifically. Multi-vector-per-item and server-side RRF
+    # are cloud-only in this line, so the local PersistentClient store uses one
+    # collection per vector space. Bump deliberately, re-verifying the guard.
+    "chromadb==1.5.9",
     "pyyaml>=6.0,<7",
     "tomli>=2.0.0; python_version < '3.11'",
     # Multilingual embedding model deps. Onboarding now offers the

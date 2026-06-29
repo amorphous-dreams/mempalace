@@ -142,6 +142,50 @@ _HNSW_BLOAT_GUARD = {
     "hnsw:sync_threshold": 2,
 }
 
+
+def _hnsw_creation_metadata(options: Optional[dict]) -> dict:
+    """Build the ``metadata=`` dict for a fresh collection from caller options.
+
+    Centralizes the HNSW knobs so a multi-collection palace can tune each
+    collection at creation while the base keeps every config value in the
+    ``collection_metadata`` table where the divergence guard, the cosine-space
+    detector (``ChromaCollection.distance_metric``), and ``_read_sync_threshold``
+    already read it. The legacy ``metadata=`` keys are kept deliberately: the
+    modern ``configuration=`` API stores the same parameters in
+    ``configuration_json`` instead, leaving ``collection.metadata`` empty and
+    silently blinding all of that existing tooling.
+
+    Caller option -> chromadb metadata key:
+
+    * ``hnsw_space``       -> ``hnsw:space``        (default ``"cosine"``)
+    * ``num_threads``      -> ``hnsw:num_threads``  (default 1; serializes inserts)
+    * ``ef_construction``  -> ``hnsw:construction_ef``
+    * ``max_neighbors``    -> ``hnsw:M``
+    * ``sync_threshold``   -> ``hnsw:sync_threshold``
+    * ``batch_size``       -> ``hnsw:batch_size``
+
+    ``sync_threshold``/``batch_size`` default to the small bloat-guard values
+    (immediate flush, no sub-threshold data loss). A write-heavy caller raises
+    both to amortize flushes. ``ef_construction``/``max_neighbors`` are omitted
+    when the caller does not set them, so chromadb applies its own defaults.
+    """
+    opts = options if isinstance(options, dict) else {}
+    md: dict[str, Any] = {
+        "hnsw:space": opts.get("hnsw_space", "cosine"),
+        "hnsw:num_threads": int(opts.get("num_threads", 1)),
+        **_HNSW_BLOAT_GUARD,
+    }
+    if "ef_construction" in opts and opts["ef_construction"] is not None:
+        md["hnsw:construction_ef"] = int(opts["ef_construction"])
+    if "max_neighbors" in opts and opts["max_neighbors"] is not None:
+        md["hnsw:M"] = int(opts["max_neighbors"])
+    if "sync_threshold" in opts and opts["sync_threshold"] is not None:
+        md["hnsw:sync_threshold"] = int(opts["sync_threshold"])
+    if "batch_size" in opts and opts["batch_size"] is not None:
+        md["hnsw:batch_size"] = int(opts["batch_size"])
+    return md
+
+
 # Below this size, data_level0.bin is too small for a meaningful HNSW graph.
 # Used by _hnsw_link_lists_is_usable_for_payload (empty link_lists is fine
 # when data is trivially small) and _missing_dimensionality_appears_recoverable
@@ -2125,12 +2169,24 @@ class ChromaBackend(BaseBackend):
                 pass
 
         client = self._client(palace_path)
-        hnsw_space = "cosine"
-        if options and isinstance(options, dict):
-            hnsw_space = options.get("hnsw_space", hnsw_space)
 
-        ef = self._resolve_embedding_function()
-        ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+        # Embedding-function seam (RFC 001 §embedder-injection):
+        #   * options carries the key "embedding_function"  -> use its value
+        #     verbatim, INCLUDING None. A None value is the caller-supplied-
+        #     vector mode: chromadb skips the model entirely, so the caller
+        #     MUST pass query_embeddings/embeddings and the store never
+        #     embeds anything itself. This is how a multi-collection palace
+        #     keeps a "content" and a "form" collection over caller vectors
+        #     without baking any model into the base.
+        #   * options omits the key                         -> legacy behavior:
+        #     resolve the configured embedding function; a failed resolve
+        #     (None) omits the kwarg so chromadb falls back to its default EF.
+        opts = options if isinstance(options, dict) else {}
+        if "embedding_function" in opts:
+            ef_kwargs = {"embedding_function": opts["embedding_function"]}
+        else:
+            ef = self._resolve_embedding_function()
+            ef_kwargs = {"embedding_function": ef} if ef is not None else {}
 
         if create:
             try:
@@ -2138,11 +2194,7 @@ class ChromaBackend(BaseBackend):
             except _ChromaNotFoundError:
                 collection = client.create_collection(
                     collection_name,
-                    metadata={
-                        "hnsw:space": hnsw_space,
-                        "hnsw:num_threads": 1,
-                        **_HNSW_BLOAT_GUARD,
-                    },
+                    metadata=_hnsw_creation_metadata(opts),
                     **ef_kwargs,
                 )
             except ValueError as e:
