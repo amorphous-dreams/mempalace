@@ -1216,6 +1216,62 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
     assert col.batch_sizes == [2, 2, 1]
 
 
+def test_process_file_isolates_a_failed_upsert_batch(tmp_path, monkeypatch):
+    """A single sub-batch upsert failure must NOT abort the whole file.
+
+    The stale drawers are purged before the upsert loop, so an unguarded
+    failure would strand the file with FEWER drawers than it started with AND
+    propagate up to halt every remaining file in the run. Isolating the failure
+    keeps every succeeded sub-batch filed (Incremental only) and returns the
+    partial count instead of raising.
+    """
+    from mempalace import miner
+
+    class FlakyCol:
+        def __init__(self):
+            self.upserts = []
+            self.calls = 0
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, documents, ids, metadatas):
+            self.calls += 1
+            # Fail ONLY the second sub-batch (a pathological chunk / transient
+            # backend hiccup); the first and third must still be filed.
+            if self.calls == 2:
+                raise RuntimeError("simulated HNSW segment failure")
+            self.upserts.append(len(documents))
+
+    source = tmp_path / "src.py"
+    source.write_text("print('hello')\n" * 20, encoding="utf-8")
+    chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)]
+    col = FlakyCol()
+    monkeypatch.setattr(miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
+    monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
+    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+
+    # Must NOT raise despite the middle batch failing.
+    drawers, room, skip_reason = miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+    )
+
+    # Batches 1 (2 chunks) + 3 (1 chunk) landed; batch 2 (2 chunks) was skipped.
+    assert drawers == 3
+    assert col.upserts == [2, 1]
+    assert room == "general"
+
+
 # ── normalize_version schema gate ───────────────────────────────────────
 #
 # When the normalization pipeline changes shape (e.g., strip_noise lands),

@@ -1505,6 +1505,7 @@ def process_file(
         # in production and the 4-segment pointer form lives only in tests.
         # Per PR #1584 review (Igor, 2026-05-22).
         all_metas: list = []
+        batches_failed = 0
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
             batch_ids: list = []
@@ -1528,13 +1529,45 @@ def process_file(
                     )
                 )
             assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
-            collection.upsert(
-                documents=batch_docs,
-                ids=batch_ids,
-                metadatas=batch_metas,
-            )
+            # Isolate a sub-batch upsert failure. The stale drawers for this
+            # source were already purged above, so letting a single bad chunk or
+            # a transient backend error (e.g. an HNSW segment hiccup) propagate
+            # would abort the whole file — stranding it with FEWER drawers than
+            # it started with — AND halt every remaining file in the run. Honor
+            # the batching's stated contract ("A bad chunk can fail its
+            # sub-batch"): log it, skip the sub-batch, and keep filing the rest.
+            # Every batch that succeeds still persists (Incremental only); the
+            # failed span is left for the next run to re-attempt.
+            try:
+                collection.upsert(
+                    documents=batch_docs,
+                    ids=batch_ids,
+                    metadatas=batch_metas,
+                )
+            except Exception:
+                batches_failed += 1
+                logger.warning(
+                    "Drawer upsert failed for %s (chunks %d-%d of %d) — skipping "
+                    "this sub-batch, continuing with the rest",
+                    source_file,
+                    batch_start,
+                    batch_start + len(batch_docs) - 1,
+                    len(chunks),
+                    exc_info=True,
+                )
+                continue
             drawers_added += len(batch_docs)
             all_metas.extend(batch_metas)
+
+        if batches_failed:
+            logger.warning(
+                "%s mined partially: %d/%d chunks filed, %d sub-batch(es) failed "
+                "— re-run to retry the missing spans",
+                source_file,
+                drawers_added,
+                len(chunks),
+                batches_failed,
+            )
 
         # Build closet — the searchable index pointing to these drawers.
         # Purge first: a re-mine (mtime change or normalize_version bump) must
