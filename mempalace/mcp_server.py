@@ -71,7 +71,7 @@ from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
 from .backends.chroma import (  # noqa: E402
     ChromaBackend,
     ChromaCollection,
-    _HNSW_BLOAT_GUARD,
+    _HNSW_WRITE_DEFAULTS,
     _pin_hnsw_threads,
     hnsw_capacity_status,
 )
@@ -1152,7 +1152,7 @@ def _get_collection(create=False):
                         metadata={
                             "hnsw:space": "cosine",
                             "hnsw:num_threads": 1,
-                            **_HNSW_BLOAT_GUARD,
+                            **_HNSW_WRITE_DEFAULTS,
                         },
                         **ef_kwargs,
                     )

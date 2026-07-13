@@ -160,32 +160,35 @@ def _hnsw_payload_appears_sane(seg_dir: str) -> bool:
     return ratio is None or ratio <= _HNSW_LINK_TO_DATA_MAX_RATIO
 
 
-# HNSW batch/sync thresholds applied at collection creation.
+# HNSW batch/sync thresholds applied at collection creation — chromadb's own
+# defaults, honoring chroma's constraint batch_size < sync_threshold (#2526).
 #
-# chromadb's Rust HNSW segment writes index_metadata.pickle and
-# link_lists.bin only when internal counters cross both thresholds
-# (batch_size gates _apply_batch; sync_threshold gates _persist).
-# Records below both thresholds stay in memory and are lost on exit.
+# sync_threshold sets a mine's WRITE AMPLIFICATION: chromadb rewrites the whole
+# on-disk index once that many records accumulate since the last persist.
 #
-# Previously 50k/50k to work around link_lists.bin sparse-file bloat
-# in pre-1.5.x Python chromadb (#344).  chromadb >=1.5.4 Rust bindings
-# (the minimum mempalace supports) do not exhibit that bloat; verified
-# at batch_size=2 with 20k records: link_lists.bin = 171 KB, no
-# sparse-file inflation.
+# Both ran at 2 to answer #1579 (a sub-threshold mine left index_metadata.pickle
+# absent, and quarantine_stale_hnsw renamed the segment away). Two measurements
+# on chromadb 1.5.9 retire that:
 #
-# The 50k guard caused #1579: mines under 50k drawers never triggered
-# _persist(), leaving index_metadata.pickle absent and link_lists.bin
-# empty.  quarantine_stale_hnsw then renamed the segment on every cold
-# open after a 300s mtime gap, accumulating .drift-* directories.
+#   * It buys nothing. A 5-record collection at 100/1000 — far below the
+#     threshold, so no persist ever fires — still reads back whole from a FRESH
+#     PROCESS (count, and the vector query answers), and _segment_appears_healthy
+#     returns True (link_lists.bin at 0 bytes reads as never-persisted, not as a
+#     torn persist). The Rust writer holds the tail durable via the WAL.
 #
-# Lowered to 2 (empirical Rust-side minimum for chromadb >=1.5.4; the
-# Rust bindings reject 1 with InvalidArgumentError) so any mine of 2+
-# drawers triggers a natural persist.  Existing palaces created under
-# the old 50k guard keep those thresholds in their collection metadata
-# until the user runs repair --mode from-sqlite --archive-existing.
-_HNSW_BLOAT_GUARD = {
-    "hnsw:batch_size": 2,
-    "hnsw:sync_threshold": 2,
+#   * It corrupts at scale (#1308). At 2, a 26k-drawer mine fires ~13,000 full
+#     rewrites of a growing multi-megabyte segment: it wedges the compactor
+#     ("Failed to apply logs to the hnsw segment writer" on every later write)
+#     and opens 13,000 windows for a torn persist to truncate the pickle ("EOF
+#     while parsing"). Reproduced on a fresh palace, single writer, no
+#     concurrency. A threshold of 2 also forces the pickle-bearing persist path
+#     the Rust writer otherwise skips.
+#
+# A palace keeps whatever thresholds it was created under;
+# `repair --mode from-sqlite --archive-existing` re-creates it under these.
+_HNSW_WRITE_DEFAULTS = {
+    "hnsw:batch_size": 100,
+    "hnsw:sync_threshold": 1000,
 }
 
 
@@ -210,16 +213,19 @@ def _hnsw_creation_metadata(options: Optional[dict]) -> dict:
     * ``sync_threshold``   -> ``hnsw:sync_threshold``
     * ``batch_size``       -> ``hnsw:batch_size``
 
-    ``sync_threshold``/``batch_size`` default to the small bloat-guard values
-    (immediate flush, no sub-threshold data loss). A write-heavy caller raises
-    both to amortize flushes. ``ef_construction``/``max_neighbors`` are omitted
-    when the caller does not set them, so chromadb applies its own defaults.
+    ``sync_threshold``/``batch_size`` default to chromadb's own values
+    (:data:`_HNSW_WRITE_DEFAULTS`), which amortize the index flush across a
+    mine. A caller tunes them per collection; a caller writing far fewer
+    records than the threshold still keeps them (the Rust writer holds the
+    sub-threshold tail durable — see :data:`_HNSW_WRITE_DEFAULTS`).
+    ``ef_construction``/``max_neighbors`` are omitted when the caller does not
+    set them, so chromadb applies its own defaults.
     """
     opts = options if isinstance(options, dict) else {}
     md: dict[str, Any] = {
         "hnsw:space": opts.get("hnsw_space", "cosine"),
         "hnsw:num_threads": int(opts.get("num_threads", 1)),
-        **_HNSW_BLOAT_GUARD,
+        **_HNSW_WRITE_DEFAULTS,
     }
     if "ef_construction" in opts and opts["ef_construction"] is not None:
         md["hnsw:construction_ef"] = int(opts["ef_construction"])
@@ -677,9 +683,10 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
 # read the collection metadata (older palaces missing the row, sqlite
 # unreadable). 2000 = 2 × chromadb's default sync_threshold of 1000.
 #
-# Why dynamic: legacy palaces may still carry ``sync_threshold = 50_000``
-# (the pre-#1579 guard), so flush-lag can grow up to 50K on those palaces.
-# New palaces use sync_threshold=2 (#1579) and flush almost immediately.
+# Why dynamic: a palace carries whatever ``sync_threshold`` it was created
+# under, and flush-lag grows to that threshold before a persist fires — up
+# to 50K on a palace created under an old large guard, and 2 on one created
+# under the small guard that #1308 traces back to.
 # A fixed 2000 floor would flag actively-written legacy palaces as
 # DIVERGED the moment their queue exceeded 10% of sqlite_count, even
 # though chromadb is behaving correctly. The floor must scale with the
@@ -2335,7 +2342,7 @@ class ChromaBackend(BaseBackend):
             metadata={
                 "hnsw:space": hnsw_space,
                 "hnsw:num_threads": 1,
-                **_HNSW_BLOAT_GUARD,
+                **_HNSW_WRITE_DEFAULTS,
             },
             **ef_kwargs,
         )
