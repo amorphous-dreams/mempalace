@@ -13,6 +13,7 @@ import json
 import math
 import os
 import secrets
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -85,6 +86,21 @@ SHUTDOWN_DRAIN_SECONDS = 10.0
 # holds verbatim payloads) doesn't grow without bound across a long-lived
 # daemon. Override via env for operators who want a longer/shorter window.
 JOB_RETENTION_DAYS = int(os.environ.get("MEMPALACE_DAEMON_RETENTION_DAYS", "7") or "7")
+# Idle-reap TTL: a serve with no jobs for this many seconds shuts itself down so
+# orphaned daemons (e.g. ones detached past their parent) can't linger forever.
+# 0 (or negative) opts out — never reap. Read fresh from the env at worker start
+# so an operator/test can override per process.
+IDLE_TTL_ENV = "MEMPALACE_DAEMON_IDLE_TTL"
+DEFAULT_IDLE_TTL_SECONDS = 600.0
+# Conservative stale-serve takeover: a recorded serve whose /health no longer
+# answers but whose pid is still alive is only SIGTERM'd once it has been up at
+# least this long — long enough that a merely-slow startup is never mistaken for
+# a wedge. Override via env. The post-SIGTERM wait bounds how long start_daemon
+# waits for the wedged pid to die (and release the singleton flock).
+STALE_TAKEOVER_SECONDS = float(
+    os.environ.get("MEMPALACE_DAEMON_TAKEOVER_STALE_SECONDS", "60") or "60"
+)
+STALE_TAKEOVER_WAIT = 5.0
 try:
     import fcntl as _fcntl  # POSIX only; absent on Windows
 except ImportError:  # pragma: no cover - Windows fallback
@@ -240,6 +256,110 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def serve_lock_path(palace_path: str) -> Path:
+    return state_dir(palace_path) / "serve.lock"
+
+
+def _acquire_serve_lock(palace_path: str):
+    """Acquire the lifetime per-palace singleton lock for a serve process.
+
+    Returns an open file handle (to be HELD for the whole process life, released
+    on exit) when this process may serve the palace, or ``None`` when another
+    serve already owns it and this process must exit. The flock is non-blocking
+    and exclusive, so "one serve per palace" becomes an OS-enforced invariant —
+    even two ``run_server`` calls in the same process for the same palace
+    contend (flock keys on the open file description, not the pid).
+
+    On a platform without ``fcntl`` (Windows) there is no OS lock; the handle is
+    returned without locking and the existing endpoint-reuse check stays the
+    only guard there.
+    """
+    sd = state_dir(palace_path)
+    sd.mkdir(parents=True, exist_ok=True)
+    _chmod_dir_private(sd)
+    lock_path = serve_lock_path(palace_path)
+    lock_fh = open(lock_path, "w")
+    # umask may not be tightened yet at this point in run_server — set perms
+    # explicitly so the lock file is owner-only like the rest of state_dir.
+    _chmod_private(lock_path)
+    if _fcntl is None:  # pragma: no cover - Windows fallback
+        return lock_fh
+    try:
+        _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    except OSError:
+        # Already held by another serve for this palace.
+        try:
+            lock_fh.close()
+        except OSError:
+            pass
+        return None
+    return lock_fh
+
+
+def _release_serve_lock(lock_fh) -> None:
+    if lock_fh is None:
+        return
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        try:
+            lock_fh.close()
+        except OSError:
+            pass
+
+
+def _serve_age_seconds(started_at: Any) -> float | None:
+    """Seconds since a recorded serve's ``started_at`` ISO timestamp, or None
+    if it can't be parsed (treated as not-stale by callers — conservative)."""
+    try:
+        started = datetime.fromisoformat(started_at)
+    except (TypeError, ValueError):
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - started).total_seconds()
+
+
+def _reap_stale_serve(palace_path: str) -> None:
+    """SIGTERM a wedged-but-live recorded serve so a fresh serve can claim the
+    singleton flock.
+
+    A serve whose /health no longer answers (start_daemon's probe already
+    failed) but whose pid is still alive would keep holding the exclusive
+    ``serve.lock``; a freshly spawned serve would then exit as a duplicate and
+    start_daemon would time out. Conservative: act only on POSIX, only on a
+    clearly-stale (up past ``STALE_TAKEOVER_SECONDS``), live, foreign pid, and
+    wait briefly for it to die (and drop the lock) before returning.
+    """
+    if os.name == "nt":  # pragma: no cover - POSIX-only; no flock singleton on Windows
+        return
+    try:
+        endpoint = _read_endpoint(palace_path)
+    except DaemonError:
+        return
+    pid = endpoint.get("pid")
+    if not pid:
+        return
+    pid = int(pid)
+    if pid == os.getpid() or not _pid_alive(pid):
+        return
+    age = _serve_age_seconds(endpoint.get("started_at"))
+    if age is None or age < STALE_TAKEOVER_SECONDS:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.monotonic() + STALE_TAKEOVER_WAIT
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.1)
 
 
 @dataclass
@@ -693,6 +813,9 @@ class DaemonRuntime:
         # job_id -> monotonic deadline before which a lock-refused job is not
         # re-claimed (#2014). Worker-owned; only _worker_loop touches it.
         self._deferred_until: dict[str, float] = {}
+        # Set by run_server once the HTTP server exists: lets the worker trigger
+        # a clean serve shutdown (idle-reap) without reaching into the closure.
+        self.shutdown_server: Any = None
 
     def start_worker(self) -> threading.Thread:
         self.store.recover_running()
@@ -745,9 +868,32 @@ class DaemonRuntime:
             job_id: until for job_id, until in self._deferred_until.items() if until > now
         }
         return set(self._deferred_until)
+    @staticmethod
+    def _idle_ttl_seconds() -> float:
+        raw = os.environ.get(IDLE_TTL_ENV)
+        if raw is None:
+            return DEFAULT_IDLE_TTL_SECONDS
+        try:
+            return float(raw)
+        except ValueError:
+            return DEFAULT_IDLE_TTL_SECONDS
+
+    def _trigger_idle_shutdown(self) -> None:
+        """Reap an idle serve: signal the loop to stop and ask the HTTP server to
+        return from serve_forever (its finally drains + cleans up state_dir)."""
+        self.shutdown_event.set()
+        cb = self.shutdown_server
+        if cb is not None:
+            try:
+                cb()
+            except Exception:  # noqa: BLE001 - reap is best-effort, never fatal
+                pass
 
     def _worker_loop(self) -> None:
         from .service import execute_job
+
+        idle_ttl = self._idle_ttl_seconds()
+        last_activity = time.monotonic()
 
         while not self.shutdown_event.is_set():
             try:
@@ -756,6 +902,12 @@ class DaemonRuntime:
                 self.shutdown_event.wait(1.0)
                 continue
             if job is None:
+                # Idle-reap: a serve that has done no work for longer than the TTL
+                # shuts itself down so orphaned daemons can't accumulate. TTL <= 0
+                # opts out (never reap).
+                if idle_ttl > 0 and (time.monotonic() - last_activity) >= idle_ttl:
+                    self._trigger_idle_shutdown()
+                    return
                 self.worker_wake.wait(0.5)
                 self.worker_wake.clear()
                 continue
@@ -813,6 +965,7 @@ class DaemonRuntime:
                 )
             finally:
                 self.active_job_id = None
+                last_activity = time.monotonic()
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -871,6 +1024,21 @@ def _close_or_defer_writer_lease(
 
 def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -> None:
     palace_path = canonical_palace_path(palace_path)
+    # Lifetime singleton lock: acquire BEFORE any env/umask mutation, port bind,
+    # or endpoint write so a second serve for this palace exits cleanly with no
+    # side effects. Held for the whole process; released in the outer finally.
+    serve_lock_fh = _acquire_serve_lock(palace_path)
+    if serve_lock_fh is None:
+        # Another serve already owns this palace (OS-enforced singleton). Do not
+        # bind a port or overwrite endpoint.json/pid — just exit.
+        return
+    try:
+        _run_server_locked(palace_path, backend=backend, port=port)
+    finally:
+        _release_serve_lock(serve_lock_fh)
+
+
+def _run_server_locked(palace_path: str, *, backend: str | None = None, port: int = 0) -> None:
     previous_env = {
         "MEMPALACE_PALACE_PATH": os.environ.get("MEMPALACE_PALACE_PATH"),
         "MEMPALACE_BACKEND_EXPLICIT": os.environ.get("MEMPALACE_BACKEND_EXPLICIT"),
@@ -1056,6 +1224,12 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
             }
             _write_private(endpoint_path(palace_path), json.dumps(endpoint, indent=2) + "\n")
             _write_private(pid_path(palace_path), f"{os.getpid()}\n")
+            # Let the worker reap an idle serve by returning from serve_forever
+            # (its finally drains + cleans up state). A separate thread runs the
+            # shutdown so the worker thread itself never blocks on the join.
+            runtime.shutdown_server = lambda: threading.Thread(
+                target=httpd.shutdown, daemon=True
+            ).start()
             runtime.start_worker()
             try:
                 httpd.serve_forever(poll_interval=0.5)
@@ -1310,6 +1484,11 @@ def start_daemon(
                 return existing
             # The other starter failed without bringing the daemon up; fall
             # through and spawn ourselves (we now hold the lock).
+
+    # Takeover: a wedged serve (health-dead but pid alive) still holds the
+    # singleton serve.lock; a fresh spawn would exit as a duplicate and we'd time
+    # out. If it is clearly stale, SIGTERM it so the new serve can claim the lock.
+    _reap_stale_serve(palace_path)
 
     for stale in (endpoint_path(palace_path), pid_path(palace_path)):
         try:
