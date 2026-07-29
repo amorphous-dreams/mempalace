@@ -74,6 +74,7 @@ from .backends.chroma import (  # noqa: E402
     _HNSW_WRITE_DEFAULTS,
     _pin_hnsw_threads,
     hnsw_capacity_status,
+    reset_hnsw_capacity_cache,
 )
 from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
@@ -342,6 +343,11 @@ _last_request_time: float = time.monotonic()
 _sqlite_integrity_checked = False
 _sqlite_integrity_errors: list[str] = []
 _sqlite_integrity_check_error = ""
+# Serializes quick_check runs between the async startup preflight thread and
+# lazy consumers on the protocol thread (double-checked in
+# _ensure_sqlite_integrity_status) so the O(database size) probe never runs
+# twice concurrently.
+_sqlite_integrity_refresh_lock = threading.Lock()
 _SQLITE_INTEGRITY_ERROR_CODE = -32002
 _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
     {
@@ -526,6 +532,12 @@ def _refresh_sqlite_integrity_status() -> None:
     SQLite-layer corruption (#1818).
     """
 
+    with _sqlite_integrity_refresh_lock:
+        _refresh_sqlite_integrity_status_locked()
+
+
+def _refresh_sqlite_integrity_status_locked() -> None:
+    # Probe body; callers must hold _sqlite_integrity_refresh_lock.
     global _sqlite_integrity_checked
     global _sqlite_integrity_errors
     global _sqlite_integrity_check_error
@@ -583,8 +595,14 @@ def _refresh_sqlite_integrity_status() -> None:
 
 
 def _ensure_sqlite_integrity_status() -> None:
-    if not _sqlite_integrity_checked:
-        _refresh_sqlite_integrity_status()
+    if _sqlite_integrity_checked:
+        return
+    with _sqlite_integrity_refresh_lock:
+        # Double-checked: the startup preflight thread may have finished the
+        # probe while this caller waited on the lock — don't pay the
+        # O(database size) quick_check twice.
+        if not _sqlite_integrity_checked:
+            _refresh_sqlite_integrity_status_locked()
 
 
 def _sqlite_integrity_payload() -> dict:
@@ -830,6 +848,12 @@ def _force_chroma_cache_reset() -> None:
     _palace_db_mtime = 0.0
     _metadata_cache = None
     _metadata_cache_time = 0
+    # This runs on the #1315 retry path, which drops caches precisely to
+    # re-observe the palace after a transient index error. The capacity verdict
+    # is another cached view of that same palace, so it must be dropped too, or
+    # the retry could be answered from the pre-error verdict (its 10 s ceiling
+    # outlasts the 2 s retry sleep).
+    reset_hnsw_capacity_cache()
     try:
         from .palace import get_backend_for_palace
 
@@ -3814,7 +3838,10 @@ def tool_reconnect():
     ChromaBackend._quarantined_paths.discard(_config.palace_path)
     # Force probe re-run on next _get_client by clearing the flag now;
     # _refresh_vector_disabled_flag will re-set it if the divergence
-    # still applies after the reconnect.
+    # still applies after the reconnect. The probe keeps its own cache
+    # (#1471), so drop that too — otherwise the "re-run" would be served
+    # from the verdict this reconnect is meant to discard.
+    reset_hnsw_capacity_cache()
     _vector_disabled = False
     _vector_disabled_reason = ""
     # Drain the per-path KnowledgeGraph cache so a replaced sqlite file is
@@ -3881,7 +3908,7 @@ def tool_reconnect():
         return {"success": False, "error": str(e)}
 
 
-def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
+def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
     """Batch session save in a single call.
 
     Semantic-dedups each item, files the non-duplicates as drawers, then
@@ -3892,6 +3919,9 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
 
     ``items`` is a list of ``{"wing", "room", "content"}`` dicts. ``diary``
     is an optional ``{"agent_name", "entry", "topic"?, "wing"?}`` dict.
+    ``added_by`` attributes the filed drawers; when omitted it falls back to
+    the diary's ``agent_name`` (and then to ``"checkpoint"``), so the agent
+    that filed the session is recorded instead of a generic label.
     Reuses the existing single-item handlers so dedup/idempotency/WAL
     behaviour is identical to calling them directly.
     """
@@ -3908,6 +3938,20 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
     out = {"added": [], "duplicates": [], "errors": []}
     if not isinstance(items, list):
         return {"error": "items must be a list of {wing, room, content} objects"}
+    # Drawer attribution: an explicit ``added_by`` wins; otherwise fall back to
+    # the diary's ``agent_name`` (the agent filing this session); otherwise the
+    # legacy ``"checkpoint"`` label. A blank, whitespace-only, or non-string
+    # value counts as unspecified at each step, so an empty explicit argument
+    # still defers to the diary instead of masking it. The chosen name is stored
+    # verbatim (tool_add_drawer strips lone surrogates but does not case-fold),
+    # matching how every other caller records ``added_by``; the diary index
+    # lowercases the same name separately for case-insensitive reads.
+    resolved_added_by = added_by if isinstance(added_by, str) and added_by.strip() else None
+    if resolved_added_by is None and isinstance(diary, dict):
+        agent = diary.get("agent_name")
+        resolved_added_by = agent if isinstance(agent, str) and agent.strip() else None
+    if resolved_added_by is None:
+        resolved_added_by = "checkpoint"
     for item in items:
         if not isinstance(item, dict):
             out["errors"].append({"item": item, "error": "item must be an object"})
@@ -3930,7 +3974,7 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
         # string by the guard above) we still file rather than drop the
         # memory: verbatim recall is the priority and add_drawer's own
         # idempotency blocks exact duplicates.
-        res = tool_add_drawer(wing=wing, room=room, content=content, added_by="checkpoint")
+        res = tool_add_drawer(wing=wing, room=room, content=content, added_by=resolved_added_by)
         if res.get("success"):
             out["added"].append(res)
         else:
@@ -4334,6 +4378,10 @@ TOOLS = {
                 "dedup_threshold": {
                     "type": "number",
                     "description": "Similarity threshold 0-1 for the per-item dedup check (default 0.9)",
+                },
+                "added_by": {
+                    "type": "string",
+                    "description": "Who is filing these drawers. An explicit value takes precedence; otherwise the diary agent_name, else 'checkpoint'.",
                 },
             },
             "required": ["items"],
@@ -5188,6 +5236,28 @@ def _build_http_server(host: str, port: int):
         daemon_threads = True
         allow_reuse_address = True
 
+        def handle_error(self, request, client_address):
+            # A client hanging up mid-response makes the send path raise
+            # ConnectionError (BrokenPipeError / ConnectionResetError), or
+            # ssl.SSLEOFError over TLS. That is a routine disconnect, not a
+            # server fault, so log it at DEBUG rather than let the default
+            # handler dump a per-request traceback. Real errors (including
+            # genuine TLS handshake/cert failures) still reach that handler.
+            exc = sys.exc_info()[1]
+            is_disconnect = isinstance(exc, ConnectionError)
+            if not is_disconnect:
+                import ssl
+
+                # Only the abrupt-EOF SSLError; genuine TLS errors must surface.
+                is_disconnect = isinstance(exc, ssl.SSLEOFError)
+            if is_disconnect:
+                logger.debug(
+                    "HTTP client %s disconnected before the response completed",
+                    client_address,
+                )
+                return
+            super().handle_error(request, client_address)
+
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         timeout = 10
@@ -5357,6 +5427,21 @@ def _serve_http(host: str, port: int) -> None:
             logger.info("MemPalace MCP HTTP server shutting down")
 
 
+def _startup_preflight() -> None:
+    """Startup SQLite integrity + HNSW capacity probes, off the protocol thread.
+
+    Runs the same checks the stdio loop used to run synchronously before
+    reading the first request. Failures must never take down the server: the
+    lazy consumers (_ensure_sqlite_integrity_status, _get_client) re-run or
+    re-check on demand, so an exception here only loses the early warning.
+    """
+    try:
+        _ensure_sqlite_integrity_status()
+        _refresh_vector_disabled_flag()
+    except Exception:
+        logger.exception("startup preflight failed")
+
+
 def _run_stdio_loop() -> None:
     _restore_stdout()
 
@@ -5373,11 +5458,19 @@ def _run_stdio_loop() -> None:
 
     logger.info("MemPalace MCP Server starting...")
 
-    # Pre-flight: probe HNSW capacity before any tool call so the warning
-    # is visible at startup rather than on first use (#1222). Pure
-    # filesystem read; never opens a chromadb client.
-    _refresh_sqlite_integrity_status()
-    _refresh_vector_disabled_flag()
+    # Pre-flight in a background thread: PRAGMA quick_check reads every page
+    # of chroma.sqlite3 (20s+ on multi-GB palaces) and running it before the
+    # protocol loop starves the client's initialize timeout, even though the
+    # handshake itself never touches the database. The #1222 intent (warnings
+    # visible at startup rather than on first use) is preserved — the probe
+    # starts now and logs as soon as it finishes; tool calls that need the
+    # verdict serialize on _sqlite_integrity_refresh_lock via
+    # _ensure_sqlite_integrity_status instead of re-running the probe.
+    threading.Thread(
+        target=_startup_preflight,
+        name="mcp-startup-preflight",
+        daemon=True,
+    ).start()
 
     # Opt-in: pre-load the embedder so the first chromadb-write tool call
     # does not pay the ONNX/CoreML cold-load tax under the MCP client
