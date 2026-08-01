@@ -447,6 +447,65 @@ class EmbeddinggemmaONNX:
         return self(input)
 
 
+class LazyEmbeddingFunction:
+    """An embedding function that builds its model on FIRST USE, never at construction.
+
+    A store process opens a collection and hands chromadb an embedding function, then supplies its
+    own vectors on every write. Under an eager factory that store still pays the model: opening one
+    content palace imports eleven onnxruntime modules and instantiates a MiniLM session that nothing
+    ever calls. On a machine standing several palaces, that cost repeats per store process while the
+    stores themselves stay small.
+
+    Chromadb permits the deferral. Measured on 1.5.9: creating a collection touches only
+    ``is_legacy`` on the function object, and neither ``add(embeddings=...)`` nor ``get`` reaches it
+    at all — so a process that always supplies vectors never triggers a build. A process that DOES
+    embed (a dedicated embed holder) pays exactly the same cost it paid before, one call later.
+
+    TWO THINGS ANSWER WITHOUT BUILDING, and both are load-bearing:
+
+    ``is_legacy`` — chroma reads it at collection creation, before any embedding could happen.
+    Answering it by building would defeat the whole point.
+
+    ``name()`` — chroma records the function's name on the collection and compares it on later
+    opens; that comparison is what surfaces "you changed embedder without a rebuild-index" instead
+    of silently returning vectors from an incomparable space. A proxy that could not answer it
+    statically would erase that guard, which an earlier draft of this class did.
+    """
+
+    __slots__ = ("_thunk", "_ef", "is_legacy")
+
+    #: What the concrete functions report to chroma. Kept in one place so the proxy and the real
+    #: function cannot drift apart and quietly turn a mismatch into silence.
+    CHROMA_EF_NAME = "default"
+
+    def __init__(self, thunk):
+        self._thunk = thunk
+        self._ef = None
+        # chroma reads this attribute at collection creation. Answer without building.
+        self.is_legacy = False
+
+    def name(self) -> str:
+        """The name chroma stores and compares — answered from the class, never from the model."""
+        return self.CHROMA_EF_NAME
+
+    def resolved(self):
+        """The real embedding function, built on first ask."""
+        if self._ef is None:
+            self._ef = self._thunk()
+        return self._ef
+
+    @property
+    def built(self) -> bool:
+        """Whether the model has actually loaded. Useful to assert a store never embedded."""
+        return self._ef is not None
+
+    def __call__(self, input):  # noqa: A002 — chroma's parameter name
+        return self.resolved()(input)
+
+    def __getattr__(self, name):
+        return getattr(self.resolved(), name)
+
+
 def get_embedding_function(device: Optional[str] = None, model: Optional[str] = None):
     """Return a cached embedding function for the requested device + model.
 
@@ -490,6 +549,18 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         providers,
     )
     return ef
+
+
+def get_lazy_embedding_function(device=None, model=None) -> LazyEmbeddingFunction:
+    """The same function, deferred — see :class:`LazyEmbeddingFunction`.
+
+    Callers that hand an embedding function to a STORE and then supply their own vectors want this
+    one: it keeps the store's contract intact while leaving the model unbuilt. Callers that embed
+    should keep using :func:`get_embedding_function`, which states that intent plainly.
+
+    Both share ``_EF_CACHE``, so a process doing both pays for one model, not two.
+    """
+    return LazyEmbeddingFunction(lambda: get_embedding_function(device=device, model=model))
 
 
 def describe_device(device: Optional[str] = None) -> str:

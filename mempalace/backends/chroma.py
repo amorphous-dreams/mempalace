@@ -2173,14 +2173,32 @@ class ChromaBackend(BaseBackend):
 
     @staticmethod
     def _resolve_embedding_function():
-        """Return the EF for the user's ``embedding_device`` setting.
+        """Return the EF for the user's ``embedding_device`` setting, DEFERRED.
 
         Both ``get_collection`` and ``get_or_create_collection`` must receive
         the EF explicitly — ChromaDB 1.x does not persist it with the
         collection, so a reader that omits the argument silently gets the
         library default and its queries won't match the writer's vectors.
+
+        ``MEMPALACE_LAZY_EMBEDDER=1`` binds the function without building it.
+        "Must receive" and "must load a model" differ: a caller that supplies
+        its own vectors needs the binding and never the model, yet still paid a
+        full onnxruntime session per store process. A host standing several
+        palaces pays that per store.
+
+        It stays OPT-IN rather than default. chroma's embedder-mismatch
+        detection behaves differently against a proxy — the
+        `rebuild-index` hint stops surfacing — and that guard protects against
+        silently querying an incomparable vector space, which costs more than
+        the model does. A caller that opts in accepts that trade knowingly,
+        because it supplies every vector itself and never queries by text.
+        See :class:`mempalace.embedding.LazyEmbeddingFunction`.
         """
         try:
+            if os.environ.get("MEMPALACE_LAZY_EMBEDDER", "").strip() == "1":
+                from ..embedding import get_lazy_embedding_function
+
+                return get_lazy_embedding_function()
             from ..embedding import get_embedding_function
 
             return get_embedding_function()
