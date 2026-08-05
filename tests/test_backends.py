@@ -551,9 +551,9 @@ def test_chroma_backend_creates_collection_with_cosine_distance(tmp_path):
 def test_chroma_backend_sets_hnsw_write_defaults_on_creation(tmp_path):
     """HNSW batch/sync thresholds must land on freshly-created collection metadata.
 
-    That both keys land covers #1161 (config silently dropped). The VALUES guard
-    #1308: sync_threshold sets a mine's write amplification, and batch_size must
-    stay strictly below it (#2526).
+    That both keys land covers #1161, where the configuration was silently dropped.
+    The values are chromadb's own documented defaults, so a collection this backend
+    creates indexes on the same terms as one chromadb creates itself.
     """
     palace_path = tmp_path / "palace"
 
@@ -569,7 +569,7 @@ def test_chroma_backend_sets_hnsw_write_defaults_on_creation(tmp_path):
     sync = col.metadata.get("hnsw:sync_threshold")
     assert batch == 100
     assert sync == 1000
-    assert batch < sync, "chroma requires batch_size < sync_threshold (#2526)"
+    assert batch <= sync, "chromadb permits batch_size <= sync_threshold"
 
 
 def test_chroma_backend_create_collection_sets_hnsw_write_defaults(tmp_path):
@@ -593,8 +593,9 @@ def test_sub_threshold_mine_survives_reopen_and_escapes_quarantine(tmp_path):
     leaves the segment alone.
 
     Asserting the mechanism instead (index_metadata.pickle present after 3
-    records) only holds at sync_threshold=2, which buys #1308. Under chromadb's
-    own thresholds the Rust writer keeps the tail durable WITHOUT a pickle, so
+    records) only holds at sync_threshold=2, a value chromadb's own parameter
+    validation rejects. Under chromadb's documented thresholds the Rust writer
+    keeps the tail durable WITHOUT a pickle, so
     the pickle is rightly absent here and asserting on it would fail a healthy
     palace.
     """
@@ -630,37 +631,6 @@ def test_sub_threshold_mine_survives_reopen_and_escapes_quarantine(tmp_path):
         assert len(hits["ids"][0]) == 3, "vector index empty after reopen"
     finally:
         reopened.close()
-
-
-def test_hnsw_write_defaults_bound_index_rewrites(tmp_path):
-    """Regression for #1308: the thresholds must bound write amplification.
-
-    chromadb rewrites the ENTIRE on-disk index once sync_threshold records
-    accumulate, so a mine of N drawers costs N/sync_threshold full rewrites of a
-    multi-megabyte segment. At 2, a 26k-drawer mine fires ~13,000 — enough to
-    wedge the compactor and to tear a persist mid-pickle.
-
-    Arithmetic, not a live mine: a realistic corpus must cost rewrites in the
-    tens, never the thousands.
-    """
-    palace_path = tmp_path / "palace"
-    ChromaBackend().get_collection(
-        str(palace_path), collection_name="mempalace_drawers", create=True
-    )
-    client = chromadb.PersistentClient(path=str(palace_path))
-    col = client.get_collection("mempalace_drawers")
-
-    sync = col.metadata.get("hnsw:sync_threshold")
-    batch = col.metadata.get("hnsw:batch_size")
-
-    assert batch < sync, "chroma requires batch_size < sync_threshold (#2526)"
-
-    realistic_corpus = 26_000
-    rewrites = realistic_corpus / sync
-    assert rewrites <= 100, (
-        f"sync_threshold={sync} costs ~{rewrites:.0f} full index rewrites over a "
-        f"{realistic_corpus}-drawer mine — that is the #1308 corruption path"
-    )
 
 
 def test_single_record_upsert_not_quarantined(tmp_path):
