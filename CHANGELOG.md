@@ -42,6 +42,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Operator write-routing / single-writer recovery notes in `docs/write-routing-policy.md`. (#2079)
 - Remote-server guide wording for read-only tools that change host state. (#2126)
+- **The README's Docker section leads with the published image.** It previously documented only `docker build`, even though `ghcr.io/mempalace/mempalace` ships multi-arch — and a clone builds `develop`, not the release, so a build and a pull could differ silently. It now covers what the omissions actually cost: the MCP client config mounts a transcripts directory (without one the server starts and every mine finds nothing), the first embedding call downloads ~80 MB into `/data` and looks like a hang, bind mounts keep host ownership against the image's uid 1000 so a `0700` directory fails with a bare `PermissionError` on Linux (and `--user` is the wrong fix — `/data` is mode 700 owned by that uid), mining sources can be mounted read-only, and the GPU image is x86_64-only. (#2196)
 
 ### Internal
 
