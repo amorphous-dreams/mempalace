@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-from argparse import Namespace
 
 import pytest
 
@@ -132,7 +131,7 @@ def test_missing_spool_raises_not_found(tmp_dir):
 
 
 def test_end_to_end_mine_source_ndjson_files_drawers(tmp_dir, palace_path):
-    from mempalace.cli import _mine_via_source_adapter
+    from mempalace.cli import mine_source_adapter
     from mempalace.palace import get_collection
 
     spool = _write_spool(
@@ -145,8 +144,7 @@ def test_end_to_end_mine_source_ndjson_files_drawers(tmp_dir, palace_path):
             }
         ],
     )
-    args = Namespace(source="ndjson", dir=spool, wing=None, dry_run=False)
-    _mine_via_source_adapter(args, palace_path)
+    mine_source_adapter(source_name="ndjson", source_path=spool, palace_path=palace_path, dry_run=False)
 
     col = get_collection(palace_path, create=True)
     got = col.get(where={"source_file": "feed://e2e/1"})
@@ -158,12 +156,11 @@ def test_end_to_end_mine_source_ndjson_files_drawers(tmp_dir, palace_path):
 
 
 def test_end_to_end_dry_run_files_nothing(tmp_dir, palace_path):
-    from mempalace.cli import _mine_via_source_adapter
+    from mempalace.cli import mine_source_adapter
     from mempalace.palace import get_collection
 
     spool = _write_spool(tmp_dir, [{"content": "c", "source_file": "feed://dry/1"}])
-    args = Namespace(source="ndjson", dir=spool, wing=None, dry_run=True)
-    _mine_via_source_adapter(args, palace_path)
+    mine_source_adapter(source_name="ndjson", source_path=spool, palace_path=palace_path, dry_run=True)
 
     col = get_collection(palace_path, create=True)
     assert col.get(where={"source_file": "feed://dry/1"})["ids"] == []

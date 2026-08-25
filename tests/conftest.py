@@ -40,6 +40,7 @@ _TEST_EMBED_DIM = 384
 _TEST_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _REAL_EMBEDDING_TEST_MODULES = {
     "test_embedding",
+    "test_embedding_api",
     "test_embeddinggemma",
 }
 

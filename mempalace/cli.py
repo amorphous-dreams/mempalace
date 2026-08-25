@@ -6,6 +6,7 @@ Three ways to ingest:
   Projects:      mempalace mine ~/projects/my_app                  (code, docs, notes)
   Conversations: mempalace mine <convo-dir> --mode convos          (Claude Code, Claude.ai, ChatGPT, Slack exports)
   Documents:     mempalace mine <docs-dir> --mode extract          (PDF, DOCX, PPTX, XLSX, RTF, EPUB — requires mempalace[extract])
+  Adapters:      mempalace mine <source> --source <adapter-name>  (registered source adapters)
 
 Same palace. Same search. Different ingest strategies.
 
@@ -15,6 +16,7 @@ Commands:
     mempalace mine <dir>                  Mine project files (default)
     mempalace mine <dir> --mode convos    Mine conversation exports
     mempalace mine <dir> --mode extract   Mine binary office documents (PDF/DOCX/etc.)
+    mempalace mine <source> --source NAME Mine through a registered source adapter
     mempalace search "query"              Find anything, exact words
     mempalace mcp                         Show MCP setup command
     mempalace wake-up                     Show L0 + L1 wake-up context
@@ -29,11 +31,12 @@ Examples:
     mempalace search "pricing discussion" --wing my_app --room costs
 """
 
-import os
-import sys
-import shlex
-import time
 import argparse
+import contextlib
+import os
+import shlex
+import sys
+import warnings
 from pathlib import Path
 
 from .config import MempalaceConfig
@@ -128,6 +131,13 @@ def _gather_origin_samples(project_dir) -> list:
         if total_chars >= _PASS_ZERO_TOTAL_CAP:
             break
         try:
+            # ``scan_for_detection`` picks candidates by extension, so a FIFO
+            # named ``notes.md`` reaches this loop; opening one for reading
+            # blocks until a writer appears. ``is_file()`` stats instead.
+            # It belongs inside the try: it raises PermissionError on an
+            # unreadable directory, which the open below used to absorb.
+            if not filepath.is_file():
+                continue
             with open(filepath, encoding="utf-8", errors="replace") as f:
                 content = f.read(_PASS_ZERO_PER_FILE_CAP)
         except OSError:
@@ -167,7 +177,7 @@ def _run_pass_zero(project_dir, palace_dir, llm_provider) -> dict:
 
     samples = _gather_origin_samples(project_dir)
     if not samples:
-        print("  Skipping corpus-origin detection — no readable samples.")
+        print("  Skipping corpus-origin detection -- no readable samples.")
         return None
 
     # Tier 1 — always runs. Cheap regex grep, no API.
@@ -260,9 +270,17 @@ def _ensure_mempalace_files_gitignored(project_dir) -> bool:
     if not (project_path / ".git").exists():
         return False
     gitignore = project_path / ".gitignore"
+    # ``exists()`` is true for a FIFO, and both the read below and the append
+    # at the end of this function would block in the kernel on one. Decide by
+    # type instead: an absent file still yields "" as before, a regular one
+    # is read, and anything else is left untouched.
+    if gitignore.exists() and not gitignore.is_file():
+        return False
     # Force UTF-8: Windows defaults to GBK and chokes on non-ASCII .gitignore
     # comments, killing auto-init even though the file is valid UTF-8.
-    existing = gitignore.read_text(encoding="utf-8", errors="replace") if gitignore.exists() else ""
+    existing = (
+        gitignore.read_text(encoding="utf-8", errors="replace") if gitignore.is_file() else ""
+    )
     existing_lines = {line.strip() for line in existing.splitlines()}
     missing = [p for p in _MEMPALACE_PROJECT_FILES if p not in existing_lines]
     if not missing:
@@ -417,9 +435,19 @@ def cmd_init(args):
         if confirmed["people"] or confirmed["projects"] or confirmed.get("topics"):
             project_path = Path(args.dir).expanduser().resolve()
             entities_path = project_path / "entities.json"
-            with open(entities_path, "w", encoding="utf-8") as f:
-                json.dump(confirmed, f, indent=2, ensure_ascii=False)
-            print(f"  Entities saved: {entities_path}")
+            # Opening a pre-existing FIFO for writing blocks in the kernel
+            # until a reader appears. Only a regular file is a valid target
+            # for the per-project audit trail; the global registry merge
+            # below is unaffected either way.
+            if entities_path.exists() and not entities_path.is_file():
+                print(
+                    f"  ! Not writing entities: {entities_path} is not a regular file",
+                    file=sys.stderr,
+                )
+            else:
+                with open(entities_path, "w", encoding="utf-8") as f:
+                    json.dump(confirmed, f, indent=2, ensure_ascii=False)
+                print(f"  Entities saved: {entities_path}")
 
             from .config import normalize_wing_name
             from .miner import add_to_known_entities
@@ -432,10 +460,17 @@ def cmd_init(args):
             registry_path = add_to_known_entities(confirmed, wing=wing)
             print(f"  Registry updated: {registry_path}")
     else:
-        print("  No entities detected — proceeding with directory-based rooms.")
+        print("  No entities detected -- proceeding with directory-based rooms.")
 
     # Pass 2: detect rooms from folder structure
-    detect_rooms_local(project_dir=args.dir, yes=getattr(args, "yes", False))
+    try:
+        detect_rooms_local(project_dir=args.dir, yes=getattr(args, "yes", False))
+    except OSError as exc:
+        # Writing mempalace.yaml is the point of init; a target it cannot
+        # write (a pre-existing pipe, a full disk) is a hard failure, and a
+        # message beats the traceback this used to produce.
+        print(f"\n  ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
     cfg.init()
     backend = _backend_arg(args)
     if backend:
@@ -562,15 +597,19 @@ def _mine_args_forwardable(args, include_ignored) -> bool:
     """Only forward mines the ``mempalace_mine`` MCP tool can express.
 
     Flags the tool has no parameters for (kg-extract, gitignore handling,
-    chunking overrides, origin redetection, explicit backend, source-adapter
-    selection) keep the direct path — where a held writer lease still surfaces
-    as the existing MineAlreadyRunning error rather than being silently dropped.
+    chunking overrides, origin redetection, explicit backend, an explicit
+    source adapter) keep the direct path — where a held writer lease still
+    surfaces as the existing MineAlreadyRunning error rather than being
+    silently dropped.
+
+    ``--source NAME`` stays direct because the tool carries no parameter for
+    it: forwarded without one, the hub would run a DEFAULT mine and report
+    success, so the adapter the operator named would be silently skipped
+    rather than refused.
     """
-    if getattr(args, "source", None):
-        # The tool carries no `source` parameter, so forwarding a --source mine
-        # would run the default --mode path under a different name.
-        return False
     if getattr(args, "kg_extract", False) or getattr(args, "redetect_origin", False):
+        return False
+    if getattr(args, "source", None):
         return False
     if args.no_gitignore or include_ignored:
         return False
@@ -683,115 +722,10 @@ def _forward_mine_to_hub(args, palace_path: str) -> bool:
     return True
 
 
-def _mine_via_source_adapter(args, palace_path):
-    """Route ``mine --source NAME`` through the RFC 002 source-adapter registry.
-
-    Opt-in seam: when an explicit ``--source`` names a registered adapter, mine
-    resolves it from ``mempalace.sources.registry``, runs its ``ingest()``, and
-    files each ``DrawerRecord`` through a ``PalaceContext``. When no ``--source``
-    is given, ``cmd_mine`` keeps its legacy ``--mode`` dispatch — the
-    filesystem/conversations miners have not moved onto the contract yet, so the
-    registry path stays opt-in and changes no existing behavior. This wires the
-    registry the spec reserves.
-    """
-    from .palace import MineAlreadyRunning
-    from .service import mine_via_source_adapter
-
-    try:
-        res = mine_via_source_adapter(
-            source_name=args.source,
-            source_dir=args.dir,
-            wing=getattr(args, "wing", None),
-            dry_run=bool(args.dry_run),
-            palace_path=palace_path,
-        )
-    except KeyError as exc:
-        print(f"mempalace: {exc}", file=sys.stderr)
-        sys.exit(2)
-    except MineAlreadyRunning as exc:
-        print(f"mempalace: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    verb = "Would file" if args.dry_run else "Drawers filed:"
-    tail = f"  (skipped {res['skipped']} up-to-date)" if res["skipped"] else ""
-    print(f"  source={res['name']}  {verb} {res['filed']}{tail}")
-
-
-def _mine_lock_wait_budget() -> float:
-    """Total seconds a direct ``mempalace mine`` waits out lock contention.
-
-    Defaults to 30s; override with ``MEMPALACE_MINE_LOCK_WAIT`` (``0`` keeps
-    the old fail-fast behaviour, with a clean give-up message).
-    """
-    raw = os.environ.get("MEMPALACE_MINE_LOCK_WAIT", "30")
-    try:
-        budget = float(raw)
-    except (TypeError, ValueError):
-        return 30.0
-    return budget if budget >= 0 else 30.0
-
-
-def _mine_with_lock_backoff(attempt, *, max_wait: float | None = None):
-    """Run ``attempt`` (a no-arg mine callable); on ``MineAlreadyRunning``
-    quietly retry with bounded exponential backoff instead of spamming the
-    holder message on every contention.
-
-    The palace single-writer lock (``mine_palace_lock``) is intentionally
-    non-blocking and raises ``MineAlreadyRunning`` so in-process callers can
-    bail; a *harvest* of back-to-back ``mempalace mine`` runs against a
-    palace a daemon already holds therefore printed the same
-    "held by PID … wait for it to finish" line over and over. This collapses
-    that to ONE notice plus a backoff (matching the deadline-loop idiom used
-    by the daemon stale-takeover and the closet_llm retry), bounds the wait,
-    then gives up cleanly. Behaviour is unchanged otherwise: it eventually
-    mines (lock frees) or exits non-zero (budget spent) — never spins
-    forever, never spams.
-
-    Returns ``attempt()``'s value on success. Raises ``SystemExit(1)`` once
-    the wait budget is exhausted. Any non-lock exception (e.g.
-    ``MineValidationError``) propagates to the caller unchanged.
-    """
-    from .palace import MineAlreadyRunning
-
-    budget = _mine_lock_wait_budget() if max_wait is None else max_wait
-    deadline = time.monotonic() + budget
-    delay = 0.5
-    announced = False
-    last_exc: "MineAlreadyRunning | None" = None
-
-    while True:
-        try:
-            return attempt()
-        except MineAlreadyRunning as exc:
-            last_exc = exc
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            if not announced:
-                # One notice for the whole contention window — the per-attempt
-                # holder line is otherwise identical and only adds noise.
-                print(
-                    f"mempalace: {exc}\n"
-                    f"  waiting up to {budget:.0f}s for the writer to finish "
-                    "(quiet retry with backoff)...",
-                    file=sys.stderr,
-                )
-                announced = True
-            time.sleep(min(delay, remaining))
-            delay = min(delay * 2, 5.0)
-
-    detail = f"mempalace: {last_exc}\n  " if last_exc else "mempalace: "
-    print(
-        f"{detail}palace still held after {budget:.0f}s; giving up. "
-        "Re-run with --daemon to queue the mine, or retry once the writer "
-        "finishes.",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    mode = getattr(args, "mode", None) or "projects"
+    source_adapter = getattr(args, "source", None)
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
@@ -800,19 +734,10 @@ def cmd_mine(args):
         print("mempalace: --background requires --daemon", file=sys.stderr)
         sys.exit(2)
 
-    # --mode carries no argparse default so it can sit in a mutually exclusive group with
-    # --source (see the parser). An unsupplied --mode means the projects path, as before.
-    if getattr(args, "mode", None) is None:
-        args.mode = "projects"
-
-
     if getattr(args, "daemon", False):
         payload = {
             "source": args.dir,
-            # source_adapter (the `--source NAME`) routes the daemon job through the RFC 002
-            # registry (run_mine's source branch), serialized against the single palace handle.
-            "source_adapter": getattr(args, "source", None),
-            "mode": args.mode,
+            "mode": mode,
             "wing": args.wing,
             "agent": args.agent,
             "limit": args.limit,
@@ -823,7 +748,29 @@ def cmd_mine(args):
             "max_chunks_per_file": getattr(args, "max_chunks_per_file", None),
             "redetect_origin": getattr(args, "redetect_origin", False),
         }
+        if source_adapter:
+            payload["source_adapter"] = source_adapter
         _submit_daemon_cli_job("mine", payload, args, background=getattr(args, "background", False))
+        return
+
+    from .palace import MineAlreadyRunning, MineValidationError
+
+    if source_adapter:
+        try:
+            drawers_written = mine_source_adapter(
+                source_name=source_adapter,
+                source_path=args.dir,
+                palace_path=palace_path,
+                dry_run=args.dry_run,
+            )
+        except (UnknownSourceAdapterError, UnsupportedSourceAdapterProtocolError) as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(2)
+        except MineAlreadyRunning as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(1)
+        suffix = " would be written" if args.dry_run else " written"
+        print(f"  Source adapter {source_adapter!r}: {drawers_written} drawer(s){suffix}.")
         return
 
     # A live HTTP hub for this palace holds the MCP writer lease, so a
@@ -843,16 +790,8 @@ def cmd_mine(args):
             llm_provider=None,
         )
 
-    # RFC 002 source-adapter seam: an explicit --source routes mine through the
-    # registry; absent it, the legacy --mode dispatch below runs unchanged.
-    if getattr(args, "source", None):
-        _mine_via_source_adapter(args, palace_path)
-        return
-
-    from .palace import MineValidationError
-
-    def _attempt():
-        if args.mode == "convos":
+    try:
+        if mode == "convos":
             from .convo_miner import mine_convos
 
             mine_convos(
@@ -863,8 +802,9 @@ def cmd_mine(args):
                 limit=args.limit,
                 dry_run=args.dry_run,
                 extract_mode=args.extract,
+                include_subagents=getattr(args, "include_subagents", False),
             )
-        elif args.mode == "extract":
+        elif mode == "extract":
             from .format_miner import mine_formats
 
             mine_formats(
@@ -889,16 +829,13 @@ def cmd_mine(args):
                 include_ignored=include_ignored,
                 max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
             )
-
-    try:
-        # A live MCP server, daemon, or another mine may already hold the
-        # palace single-writer lock. _mine_with_lock_backoff absorbs that
-        # contention with a quiet bounded retry (one notice + backoff) and
-        # exits non-zero only after the wait budget is spent — replacing the
-        # old fail-fast path that spammed the holder line once per harvest
-        # step. MineValidationError (raised after a successful mine) still
-        # propagates here.
-        _mine_with_lock_backoff(_attempt)
+    except MineAlreadyRunning as exc:
+        # A live MCP server or another mine is already writing to this
+        # palace. Surface the holder identity so the operator knows what
+        # to wait for (or stop), and exit non-zero so wrappers like
+        # nohup / scripts can detect the contention.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
     except MineValidationError as exc:
         # PRAGMA quick_check on chroma.sqlite3 returned errors at end of mine.
         # The corruption may pre-date the mine; we surface it here so automation
@@ -917,6 +854,170 @@ def cmd_mine(args):
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+class UnknownSourceAdapterError(ValueError):
+    """Raised when an explicit ``--source`` name is absent from the registry."""
+
+
+class UnsupportedSourceAdapterProtocolError(ValueError):
+    """Raised when an adapter requires runner semantics not implemented yet."""
+
+
+class _DryRunCollectionProxy:
+    """Empty collection facade that records, but never persists, writes.
+
+    Source adapters are deliberately allowed to access ``drawer_collection``
+    directly.  A dry run must not open the real backend: even read-only-looking
+    opens can create or repair backend artifacts (for example SQLite WAL files).
+    """
+
+    def __init__(self):
+        self.operations = []
+
+    def add(self, **kwargs):
+        self.operations.append(("add", kwargs))
+
+    def upsert(self, **kwargs):
+        self.operations.append(("upsert", kwargs))
+
+    def delete(self, **kwargs):
+        self.operations.append(("delete", kwargs))
+
+    def update(self, **kwargs):
+        self.operations.append(("update", kwargs))
+
+    def query(self, **kwargs):
+        from .backends import QueryResult
+
+        query_input = kwargs.get("query_texts", kwargs.get("query_embeddings"))
+        num_queries = len(query_input) if isinstance(query_input, (list, tuple)) else 1
+        include = kwargs.get("include") or []
+        return QueryResult.empty(
+            num_queries=num_queries,
+            embeddings_requested="embeddings" in include,
+        )
+
+    def get(self, **kwargs):
+        from .backends import GetResult
+
+        return GetResult.empty()
+
+    def count(self):
+        return 0
+
+
+class _DryRunKnowledgeGraphProxy:
+    """Recording no-op facade for the KG mutation surface published to adapters."""
+
+    def __init__(self):
+        self.operations = []
+
+    def add_entity(self, *args, **kwargs):
+        self.operations.append(("add_entity", args, kwargs))
+
+    def add_triple(self, *args, **kwargs):
+        self.operations.append(("add_triple", args, kwargs))
+
+    def invalidate(self, *args, **kwargs):
+        self.operations.append(("invalidate", args, kwargs))
+
+    def supersede(self, *args, **kwargs):
+        self.operations.append(("supersede", args, kwargs))
+
+
+def mine_source_adapter(
+    *,
+    source_name: str,
+    source_path: str,
+    palace_path: str,
+    dry_run: bool = False,
+) -> int:
+    """Run an explicitly selected RFC 002 source adapter through ``PalaceContext``.
+
+    This deliberately sits alongside, rather than inside, the legacy mode
+    miners.  Until those miners are migrated to first-party adapters, no-flag
+    and ``--mode`` calls must retain their established dispatch paths.
+    """
+    from .knowledge_graph import KnowledgeGraph
+    from .palace import get_collection, mine_palace_lock
+    from .sources import (
+        DrawerRecord,
+        PalaceContext,
+        SourceRef,
+        SourceItemMetadata,
+        get_adapter,
+        resolve_adapter_for_source,
+    )
+
+    adapter_name = resolve_adapter_for_source(explicit=source_name)
+    try:
+        adapter = get_adapter(adapter_name)
+    except KeyError as exc:
+        raise UnknownSourceAdapterError(
+            f"unknown source adapter {adapter_name!r}; install its adapter package or "
+            "check the adapter name with `mempalace mine --help`"
+        ) from exc
+
+    if "supports_incremental" in adapter.capabilities:
+        raise UnsupportedSourceAdapterProtocolError(
+            f"source adapter {adapter_name!r} requires incremental ingestion, which "
+            "mempalace mine does not support yet"
+        )
+
+    # A dry run must never open a collection: backend opens can create or
+    # repair storage even when requested as read-only.  Non-dry runs hold one
+    # writer lease from handle creation through adapter iteration, including
+    # direct KG mutations by adapters.
+    lock = mine_palace_lock(palace_path) if not dry_run else contextlib.nullcontext()
+    with lock:
+        knowledge_graph = None
+        try:
+            if dry_run:
+                drawer_collection = _DryRunCollectionProxy()
+                knowledge_graph = _DryRunKnowledgeGraphProxy()
+            else:
+                drawer_collection = get_collection(palace_path)
+                knowledge_graph = KnowledgeGraph(
+                    db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")
+                )
+            context = PalaceContext(
+                drawer_collection=drawer_collection,
+                knowledge_graph=knowledge_graph,
+                palace_path=palace_path,
+                config=MempalaceConfig(palace_path=palace_path),
+                adapter_name=adapter.name,
+                adapter_version=adapter.adapter_version,
+            )
+            drawers_written = 0
+            for result in adapter.ingest(
+                source=SourceRef(local_path=source_path),
+                palace=context,
+            ):
+                if isinstance(result, SourceItemMetadata):
+                    # Non-incremental adapters may report a cursor or version
+                    # while still doing a complete re-extract.  Incremental
+                    # adapters are rejected before ingest above, so accepting
+                    # this avoids a late partial-ingest failure.
+                    warnings.warn(
+                        f"Source adapter {adapter_name!r} yielded non-incremental item "
+                        "metadata; ignoring it during complete ingest",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    continue
+                if isinstance(result, DrawerRecord):
+                    drawers_written += 1
+                    context.upsert_drawer(result)
+                    continue
+                raise TypeError(
+                    f"source adapter {adapter_name!r} yielded unsupported result type "
+                    f"{type(result).__name__}"
+                )
+            return drawers_written
+        finally:
+            if knowledge_graph is not None and hasattr(knowledge_graph, "close"):
+                knowledge_graph.close()
 
 
 def cmd_sweep(args):
@@ -1008,7 +1109,7 @@ def cmd_sync(args):
     project_dirs = project_dirs or None
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Sync — Gitignore-aware drawer prune")
+    print("  MemPalace Sync -- Gitignore-aware drawer prune")
     print(f"{'=' * 55}")
     print(f"  Palace:   {palace_path}")
     if args.wing:
@@ -1045,6 +1146,7 @@ def cmd_sync(args):
     print(f"  Kept:           {report['kept']}")
     print(f"  Gitignored:     {report['gitignored']}  {removed_suffix}")
     print(f"  Missing:        {report['missing']}  {removed_suffix}")
+    print(f"  Unresolved:     {report['unresolved']}  (kept)")
     print(f"  No source:      {report['no_source']}  (kept)")
     print(f"  Out of scope:   {report['out_of_scope']}  (kept)")
 
@@ -1055,6 +1157,17 @@ def cmd_sync(args):
         print(f"\n  {label}:")
         for src, n in top:
             print(f"    {src}  ({n})")
+
+    if report["unresolved"]:
+        print("\n  Unresolved drawers are kept: nothing here could show their source file is gone.")
+        unresolved_sources = report.get("unresolved_by_source") or {}
+        if unresolved_sources:
+            top = sorted(unresolved_sources.items(), key=lambda kv: -kv[1])[:5]
+            for src, n in top:
+                print(f"    {src}  ({n})")
+            rest = len(unresolved_sources) - len(top)
+            if rest:
+                print(f"    and {rest} more source file(s)")
 
     if args.dry_run:
         if report["gitignored"] + report["missing"] > 0:
@@ -1231,6 +1344,8 @@ def cmd_search(args):
             wing=args.wing,
             room=args.room,
             n_results=args.results,
+            since=args.since,
+            before=args.before,
         )
     except SearchError:
         sys.exit(1)
@@ -1313,7 +1428,7 @@ def cmd_hallways(args):
         config=MempalaceConfig(palace_path=palace_path),
     )
     if not rows:
-        print("No hallways yet — they are built from drawer entities when you mine.")
+        print("No hallways yet -- they are built from drawer entities when you mine.")
         return
     rows.sort(key=lambda h: h.get("co_occurrence_count", 0), reverse=True)
     print(f"  {len(rows)} hallway(s):")
@@ -1436,6 +1551,256 @@ def _print_event_line(event):
     )
 
 
+def _watch_json(payload, *, follow: bool) -> str:
+    """Serialize one ``logstream watch`` record.
+
+    A single-shot watch prints exactly one document, so it is pretty-printed
+    and ``json.load``-able as-is. Under ``--follow`` there are many records
+    on one stream: indented documents concatenated back-to-back are *not*
+    valid JSON, and ``json.load`` / ``jq`` reject them with trailing data —
+    which defeats the point of a machine-readable flag on the mode meant for
+    daemons. Follow mode therefore emits NDJSON, one compact record per line.
+    """
+    import json
+
+    return (
+        json.dumps(payload, ensure_ascii=False)
+        if follow
+        else json.dumps(payload, indent=2, ensure_ascii=False)
+    )
+
+
+def _watch_spec(args, as_json) -> dict:
+    """Validate ``logstream watch`` arguments and build its filter spec.
+
+    Kept apart from the watch loop so every bad input is rejected before any
+    polling, any cursor resolution, and any checkpoint write — several of the
+    bugs on this path were arguments that only failed once the loop had
+    already started and persisted state.
+    """
+    from .logstream import normalize_watch_values, sanitize_watch_spec
+
+    if args.poll_timeout_ms is not None and args.poll_timeout_ms <= 0:
+        # A configured zero would make watch_events' expired-deadline branch
+        # yield forever without ever polling, burning a core.
+        _logstream_fail("--poll-timeout-ms must be a positive number of milliseconds", as_json)
+    if args.limit is not None and args.limit < 1:
+        # argparse accepts it; list_events would raise mid-loop, where the
+        # only handler is for KeyboardInterrupt — a traceback, and under
+        # --json no error document at all.
+        _logstream_fail("--limit must be a positive integer", as_json)
+    if args.idle_exit_ms is not None and args.idle_exit_ms < 0:
+        # Only 0 means "wait forever". A negative value arriving from config
+        # or from timeout arithmetic would otherwise take that same branch
+        # silently, leaving a harness waiting on a watcher it believes will
+        # time out.
+        _logstream_fail(
+            "--idle-exit-ms must be zero (wait forever) or a positive number of milliseconds",
+            as_json,
+        )
+
+    to_agents = list(args.to_agent or [])
+    exclude = list(args.exclude_from_agent or [])
+    if args.agent:
+        # The whole point of --agent: to_agent=<me> also matches '*'
+        # broadcasts, and your own broadcasts are broadcasts — so a watcher
+        # without this exclusion wakes itself every time it posts a status.
+        to_agents.append(args.agent)
+        exclude.append(args.agent)
+    spec = {
+        "streams": normalize_watch_values(args.stream),
+        "rooms": normalize_watch_values(args.room),
+        "types": normalize_watch_values(args.type),
+        "statuses": normalize_watch_values(args.status),
+        "to_agents": normalize_watch_values(to_agents),
+        "from_agents": normalize_watch_values(args.from_agent),
+        "exclude_from_agents": normalize_watch_values(exclude),
+        "correlation_ids": normalize_watch_values(args.correlation_id),
+    }
+    try:
+        spec = sanitize_watch_spec(spec)
+    except ValueError as exc:
+        _logstream_fail(str(exc), as_json)
+
+    return spec
+
+
+def _logstream_watch(ls, args, as_json):
+    """Run ``logstream watch`` — block until interesting events arrive.
+
+    Split out of ``cmd_logstream`` so that dispatcher stays under the
+    complexity gate: this branch carries cursor persistence, an idle timeout,
+    and follow-vs-exit semantics that no other subcommand needs.
+
+    Exit contract, chosen so a harness can background this process and treat
+    its exit as a wake-up: return (0) when a match was printed, 2 when the
+    idle timeout expired having seen nothing — the same convention
+    ``logstream wait`` uses for a timeout.
+    """
+    import time
+
+    from .logstream import (
+        WATCH_STATE_ABSENT,
+        WATCH_STATE_CORRUPT,
+        read_watch_state,
+        write_watch_cursor,
+    )
+
+    spec = _watch_spec(args, as_json)
+
+    stored_cursor, state_condition = read_watch_state(args.state_file)
+    # A missing cursor is four different facts, and only one of them may
+    # start at the tip. Treating a corrupt file or an empty-log restart as a
+    # first run skips everything that arrived since, then checkpoints past
+    # it — the loss is silent and permanent.
+    recovery_failed = state_condition == WATCH_STATE_CORRUPT
+    cursor = args.since_event_id or stored_cursor
+    skipped_from = None
+    if cursor is None and not args.from_start and state_condition == WATCH_STATE_ABSENT:
+        # Start at the tip, like the SSE live-tail does at connect time.
+        # Starting from the beginning of a long fleet log means a fresh
+        # watcher wakes holding weeks of history and cannot tell it is
+        # stale — measured 41 events, the oldest 49 days old, on a real
+        # shared brain. Backlog is the inbox sweep's job; a watcher is for
+        # what arrives from now on. Never silent: say what was skipped.
+        cursor = ls.latest_event_id()
+        skipped_from = cursor
+
+    # One place decides the starting position; one place records it. That
+    # position can arrive three ways — an explicit --since-event-id, the tip
+    # above, or None (an empty log, or --from-start) — and every one of them
+    # needs the same immediate checkpoint when no state file exists yet.
+    # Deferring to the first watch_events yield leaves a window of up to a
+    # full poll timeout in which an interrupt leaves no file behind, and the
+    # next launch calls itself a first run and jumps to the tip, skipping
+    # whatever arrived in between. Unlike later checkpoints this one cannot
+    # fail quietly: losing it costs a skipped event, not a replay.
+    if cursor is not None:
+        # Verify the anchor before it is written anywhere. list_events raises
+        # on an unknown since_event_id, and the required startup write below
+        # happens first — so a typo'd or stale --since-event-id would be
+        # persisted, then crash the first poll, and every later run without
+        # the flag would reload it and crash again until someone deleted the
+        # file by hand. Fail cleanly instead, leaving no state behind.
+        try:
+            ls.list_events(since_event_id=cursor, limit=1)
+        except ValueError as exc:
+            if args.since_event_id:
+                # Explicitly supplied and wrong: user error, so refuse
+                # without leaving anything behind to reload next time.
+                _logstream_fail(f"{exc}. Nothing was written to the state file.", as_json)
+            # A *stored* cursor whose event has gone (log rebuilt, replica
+            # reset) is corrupt state rather than user error, and refusing to
+            # start would strand the watcher exactly as an unreadable file
+            # would. Replay instead: a duplicate, never a missed delegation.
+            print(
+                f"Stored cursor {cursor} no longer exists in this log; replaying from the "
+                "start rather than refusing to run.",
+                file=sys.stderr,
+            )
+            cursor = None
+
+    if args.state_file and state_condition == WATCH_STATE_ABSENT:
+        try:
+            write_watch_cursor(args.state_file, cursor, agent=args.agent, required=True)
+        except OSError as exc:
+            _logstream_fail(
+                f"could not write the initial checkpoint to {args.state_file}: {exc}. "
+                "Refusing to start: without it a restart would skip every event "
+                "that arrives before then.",
+                as_json,
+            )
+    if not as_json:
+        where = args.agent or ", ".join(sorted(spec["to_agents"] or [])) or "everything"
+        print(f"Watching {where} from {cursor or 'now'}; Ctrl-C to stop.", file=sys.stderr)
+    if skipped_from:
+        print(
+            f"Starting at the tip ({skipped_from}); earlier events are not replayed. "
+            "Use --from-start to replay them, or sweep with `mempalace logstream list`.",
+            file=sys.stderr,
+        )
+    if recovery_failed:
+        print(
+            f"State file {args.state_file} is unreadable; replaying from the start "
+            "rather than skipping to the tip, so nothing since the last good "
+            "checkpoint is lost.",
+            file=sys.stderr,
+        )
+
+    idle_s = args.idle_exit_ms / 1000.0 if args.idle_exit_ms and args.idle_exit_ms > 0 else None
+    deadline = time.monotonic() + idle_s if idle_s else None
+    matched_any = False
+
+    def _poll_timeout_ms():
+        if deadline is None:
+            return args.poll_timeout_ms
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        return min(args.poll_timeout_ms, remaining_ms)
+
+    try:
+        for matched, cursor in ls.watch_events(
+            cursor=cursor,
+            poll_timeout_ms=_poll_timeout_ms,
+            limit=args.limit,
+            **spec,
+        ):
+            if matched:
+                matched_any = True
+                if idle_s:
+                    deadline = time.monotonic() + idle_s
+                if as_json:
+                    print(
+                        _watch_json(
+                            {
+                                "events": matched,
+                                "count": len(matched),
+                                "cursor": cursor,
+                                "timed_out": False,
+                            },
+                            follow=args.follow,
+                        ),
+                        flush=True,
+                    )
+                else:
+                    print(f"{len(matched)} event(s):")
+                    for event in matched:
+                        _print_event_line(event)
+                    sys.stdout.flush()
+                # Matched batches checkpoint *after* stdout so a kill or
+                # broken pipe between the two replays the event instead of
+                # skipping it. Unmatched advances (below) are safe immediately:
+                # those events were examined and rejected.
+                write_watch_cursor(args.state_file, cursor, agent=args.agent)
+                if not args.follow:
+                    return
+                continue
+            write_watch_cursor(args.state_file, cursor, agent=args.agent)
+            if deadline is not None and time.monotonic() >= deadline:
+                if as_json:
+                    print(
+                        _watch_json(
+                            {"events": [], "count": 0, "cursor": cursor, "timed_out": True},
+                            follow=args.follow,
+                        )
+                    )
+                else:
+                    print("Idle timeout; no matching events.")
+                sys.exit(0 if matched_any else 2)
+    except KeyboardInterrupt:
+        # Exit 0 is the documented "a match was printed" signal, so an
+        # interrupted watcher must not use it — a supervisor would report
+        # mail that never arrived. 128 + SIGINT, the shell convention.
+        if not as_json:
+            print("Stopped.", file=sys.stderr)
+        sys.exit(130)
+    except ValueError as exc:
+        # Backstop. Every known bad input is rejected before the loop
+        # starts, but a validation error escaping mid-poll would otherwise
+        # surface as a traceback — and under --json as no error document at
+        # all, which a machine consumer cannot distinguish from a crash.
+        _logstream_fail(str(exc), as_json)
+
+
 def cmd_logstream(args):
     import json
 
@@ -1503,6 +1868,8 @@ def cmd_logstream(args):
                         _print_event_line(event)
             if result.get("timed_out"):
                 sys.exit(2)
+        elif args.logstream_action == "watch":
+            _logstream_watch(ls, args, as_json)
         elif args.logstream_action == "sync":
             from .logsync import load_peers, sync_all, sync_with_peer
 
@@ -1692,6 +2059,7 @@ def cmd_repair(args):
 
     import shutil
     from .backends.chroma import ChromaBackend
+    from .backups import copy_palace_dir
     from .migrate import confirm_destructive_action, contains_palace_database
     from .repair import (
         RebuildCollectionError,
@@ -1760,8 +2128,6 @@ def cmd_repair(args):
         ):
             return
 
-        from .palace import MineAlreadyRunning
-
         try:
             counts = rebuild_from_sqlite(
                 source_palace=source_path,
@@ -1769,17 +2135,6 @@ def cmd_repair(args):
                 archive_existing_dest=archive_existing,
                 dry_run=dry_run,
             )
-        except MineAlreadyRunning as exc:
-            # The single-writer lock is held (live MCP server, daemon, or
-            # another mine). rebuild_from_sqlite takes the lock BEFORE the
-            # archive/rename, so the palace is UNTOUCHED here — no archive,
-            # no partial dest. Surface the holder and exit non-zero.
-            print(
-                f"\n  mempalace: {exc}\n"
-                "  The palace was left untouched (no archive, no partial rebuild).",
-                file=sys.stderr,
-            )
-            sys.exit(1)
         except RebuildPartialError as exc:
             # The error itself was already printed by rebuild_from_sqlite
             # with recovery instructions; surface a non-zero exit so
@@ -1794,7 +2149,7 @@ def cmd_repair(args):
             # withholds success until FTS5 rebuild, VACUUM, and quick_check are
             # clean. Its exception already includes the retained destination
             # and archive/source recovery paths.
-            print("\n  Rebuild cleanup failed — see recovery details above.")
+            print("\n  Rebuild cleanup failed -- see recovery details above.")
             sys.exit(1)
         # An empty counts dict is rebuild_from_sqlite's documented signal
         # for a validation refusal (missing source, existing dest,
@@ -1922,7 +2277,7 @@ def cmd_repair(args):
             return
         shutil.rmtree(backup_path)
     print(f"  Backing up to {backup_path}...")
-    shutil.copytree(palace_path, backup_path)
+    copy_palace_dir(palace_path, backup_path, log=print)
 
     try:
         filed = _rebuild_collection_via_temp(
@@ -2128,12 +2483,12 @@ def cmd_serve(args):
     print(f"  palace   : {palace_path}")
     print(f"  backend  : {(backend or 'default').strip().lower() if backend else 'default'}")
     print(f"  bind     : {host}:{port}  ({'loopback' if loopback else 'network-exposed'})")
-    print(f"  tls      : {'on' if tls_cert else 'off (plaintext — terminate TLS at a proxy)'}")
+    print(f"  tls      : {'on' if tls_cert else 'off (plaintext -- terminate TLS at a proxy)'}")
     print(f"  read-only: {'yes' if args.read_only else 'no'}")
     if token_created:
         print("\n  A new bearer token was generated and stored 0600 at:")
         print(f"    {_server_token_path(palace_path)}")
-        print("  Store it securely — clients need it to connect:")
+        print("  Store it securely -- clients need it to connect:")
         print(f"    {token}")
     print("\nConnect a client:")
     if token:
@@ -2168,12 +2523,15 @@ def cmd_compress(args):
     # Load dialect (with optional entity config)
     config_path = args.config
     if not config_path:
+        # ``isfile`` rather than ``exists``: the latter is true for a FIFO,
+        # and ``Dialect.from_config`` opens whatever it is handed, which
+        # blocks in the kernel on a pipe named entities.json in the cwd.
         for candidate in ["entities.json", os.path.join(palace_path, "entities.json")]:
-            if os.path.exists(candidate):
+            if os.path.isfile(candidate):
                 config_path = candidate
                 break
 
-    if config_path and os.path.exists(config_path):
+    if config_path and os.path.isfile(config_path):
         dialect = Dialect.from_config(config_path)
         print(f"  Loaded entity config: {config_path}")
     else:
@@ -2444,13 +2802,8 @@ def main():
         default=None,
         help="Storage backend to use for this mine (default: config/env/detected/chroma)",
     )
-    # --mode and --source select the ingest path and cannot both apply. argparse counts an
-    # option as "seen" for exclusivity only when its value differs from its default, so a
-    # default of "projects" here would let `--source X --mode projects` through while
-    # `--source X --mode convos` errored. default=None makes both spellings fail alike;
-    # cmd_mine restores "projects" when --mode goes unsupplied.
-    mine_path = p_mine.add_mutually_exclusive_group()
-    mine_path.add_argument(
+    mine_source_group = p_mine.add_mutually_exclusive_group()
+    mine_source_group.add_argument(
         "--mode",
         choices=["projects", "convos", "extract"],
         default=None,
@@ -2460,14 +2813,13 @@ def main():
             "mempalace[extract])"
         ),
     )
-    mine_path.add_argument(
+    mine_source_group.add_argument(
         "--source",
         default=None,
-        metavar="NAME",
+        metavar="ADAPTER",
         help=(
-            "RFC 002 source adapter to mine through (e.g. a third-party "
-            "mempalace-source-<name> package). Explicit selection only — no "
-            "auto-detect. Omit to use the legacy --mode dispatch."
+            "Use a registered source adapter. Cannot be combined with --mode; "
+            "no --source preserves legacy projects-mode mining."
         ),
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")
@@ -2529,6 +2881,17 @@ def main():
             f"summary counter. Default {_CLI_MAX_CHUNKS_PER_FILE_DEFAULT} "
             f"(or MEMPALACE_MAX_CHUNKS_PER_FILE). Set 0 to disable. Lower this on "
             f"Windows if you hit ONNX bad_alloc (#1455)."
+        ),
+    )
+    p_mine.add_argument(
+        "--include-subagents",
+        action="store_true",
+        default=False,
+        help=(
+            "Also mine Claude Code subagent transcripts (subagents/ dirs). "
+            "Excluded by default: these are short ephemeral exchanges "
+            "(Explore/Plan/Grep agents) already summarized in the parent "
+            "session, and on typical workspaces they dominate file counts."
         ),
     )
 
@@ -2596,6 +2959,20 @@ def main():
     p_search.add_argument("--wing", default=None, help="Limit to one project")
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
+    p_search.add_argument(
+        "--since",
+        default=None,
+        help=(
+            "Only drawers filed on/after this ISO date/datetime (inclusive), "
+            "e.g. 2026-04-01. Drawers without a filed_at are excluded while "
+            "a date bound is set"
+        ),
+    )
+    p_search.add_argument(
+        "--before",
+        default=None,
+        help="Only drawers filed strictly before this ISO date/datetime (exclusive)",
+    )
 
     # compress
     p_compress = sub.add_parser(
@@ -2928,6 +3305,86 @@ def main():
         "--limit", type=int, default=50, help="Max events to return on match (default 50)"
     )
     p_ls_wait.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_watch = logstream_sub.add_parser(
+        "watch",
+        help="Background watcher: block until interesting events arrive, then wake (exit 2 on idle)",
+    )
+    p_ls_watch.add_argument(
+        "--agent",
+        default=None,
+        help=(
+            "Your identity. Shorthand for --to-agent <id> --exclude-from-agent <id>: "
+            "wake for what is addressed to you (broadcasts included) but never for "
+            "your own events"
+        ),
+    )
+    p_ls_watch.add_argument(
+        "--stream", action="append", default=None, help="Stream (repeatable; matches any)"
+    )
+    p_ls_watch.add_argument(
+        "--room", action="append", default=None, help="Room (repeatable; matches any)"
+    )
+    p_ls_watch.add_argument(
+        "--type", action="append", default=None, help="Event type (repeatable; matches any)"
+    )
+    p_ls_watch.add_argument(
+        "--status", action="append", default=None, help="Status (repeatable; matches any)"
+    )
+    p_ls_watch.add_argument(
+        "--to-agent", action="append", default=None, help="Target agent (repeatable; '*' matches)"
+    )
+    p_ls_watch.add_argument(
+        "--from-agent", action="append", default=None, help="Writer agent (repeatable)"
+    )
+    p_ls_watch.add_argument(
+        "--exclude-from-agent",
+        action="append",
+        default=None,
+        help="Never wake for events written by this agent (repeatable)",
+    )
+    p_ls_watch.add_argument(
+        "--correlation-id", action="append", default=None, help="Correlation id (repeatable)"
+    )
+    p_ls_watch.add_argument(
+        "--since-event-id",
+        default=None,
+        help="Start strictly after this event id (overrides --state-file)",
+    )
+    p_ls_watch.add_argument(
+        "--state-file",
+        default=None,
+        help="Persist the cursor here so a restart resumes exactly where it stopped",
+    )
+    p_ls_watch.add_argument(
+        "--from-start",
+        action="store_true",
+        help=(
+            "Replay the log from the beginning when there is no cursor "
+            "(default: start at the tip, like the SSE live-tail)"
+        ),
+    )
+    p_ls_watch.add_argument(
+        "--follow",
+        action="store_true",
+        help="Keep watching after a match instead of exiting on the first one",
+    )
+    p_ls_watch.add_argument(
+        "--idle-exit-ms",
+        type=int,
+        default=0,
+        help="Give up after this long with no match (0 = wait forever)",
+    )
+    p_ls_watch.add_argument(
+        "--poll-timeout-ms",
+        type=int,
+        default=300000,
+        help="Long-poll length per iteration (default 300000, the server maximum)",
+    )
+    p_ls_watch.add_argument(
+        "--limit", type=int, default=50, help="Max events per poll (default 50)"
+    )
+    p_ls_watch.add_argument("--json", action="store_true", help="Machine-readable output")
 
     p_ls_ack = logstream_sub.add_parser(
         "ack", help="Acknowledge an event (appends event.ack, never mutates)"

@@ -181,13 +181,14 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     _apply_backend(payload.get("backend"))
 
     source = payload.get("source") or payload.get("dir")
+    source_adapter = payload.get("source_adapter")
     mode = payload.get("mode") or "projects"
     wing = payload.get("wing")
     agent = payload.get("agent") or "mempalace"
     limit = int(payload.get("limit") or 0)
     dry_run = bool(payload.get("dry_run"))
 
-    if payload.get("redetect_origin"):
+    if payload.get("redetect_origin") and not source_adapter:
         from .cli import _run_pass_zero
 
         _run_pass_zero(project_dir=source, palace_dir=palace_path, llm_provider=None)
@@ -196,26 +197,16 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     from .palace import MineAlreadyRunning, MineValidationError
 
     try:
-        # RFC 002 source-adapter path through the daemon queue: an explicit `source_adapter`
-        # (the `--source NAME`) routes to the registry, serialized against the daemon's single
-        # palace handle (the write seam) — same core the CLI runs, no competing direct mine.
-        if payload.get("source_adapter"):
-            res = mine_via_source_adapter(
-                source_name=payload["source_adapter"],
-                source_dir=source,
-                wing=wing,
-                dry_run=dry_run,
+        if source_adapter:
+            from .cli import mine_source_adapter
+
+            mine_source_adapter(
+                source_name=source_adapter,
+                source_path=source,
                 palace_path=palace_path,
+                dry_run=dry_run,
             )
-            return {
-                "success": True,
-                "kind": "mine",
-                "source": res["name"],
-                "filed": res["filed"],
-                "skipped": res["skipped"],
-                "exit_code": 0,
-            }
-        if mode == "convos":
+        elif mode == "convos":
             from .convo_miner import mine_convos
 
             mine_convos(
@@ -280,72 +271,14 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         return {"success": False, "error": f"mine failed: {exc}", "exit_code": 1}
 
-    return {"success": True, "kind": "mine", "mode": mode, "dry_run": dry_run, "exit_code": 0}
-
-
-def mine_via_source_adapter(
-    *,
-    source_name: str | None,
-    source_dir: str,
-    wing: str | None,
-    dry_run: bool,
-    palace_path: str,
-) -> dict[str, Any]:
-    """Run a `--source NAME` mine through the RFC 002 registry (CLI + daemon shared core).
-
-    Resolves the adapter, iterates its ``ingest()``, and files each ``DrawerRecord`` through a
-    ``PalaceContext`` under the single-writer ``mine_palace_lock``. Returns ``{name, filed,
-    skipped}``; raises ``KeyError`` (unknown adapter) / ``MineAlreadyRunning`` for the caller
-    to surface. The CLI prints the result; the daemon wraps it in a job result.
-    """
-    from .knowledge_graph import KnowledgeGraph
-    from .palace import get_collection, mine_palace_lock
-    from .sources.base import DrawerRecord, SourceItemMetadata, SourceRef
-    from .sources.context import PalaceContext
-    from .sources.registry import get_adapter, resolve_adapter_for_source
-
-    name = resolve_adapter_for_source(explicit=source_name)
-    adapter = get_adapter(name)  # raises KeyError on an unknown adapter
-
-    options: dict[str, Any] = {}
-    if wing:
-        options["wing"] = wing
-    ref = SourceRef(local_path=os.path.abspath(os.path.expanduser(source_dir)), options=options)
-
-    filed = 0
-    skipped = 0
-    with mine_palace_lock(palace_path):
-        collection = get_collection(palace_path, create=True)
-        kg = KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3"))
-        ctx = PalaceContext(
-            drawer_collection=collection,
-            knowledge_graph=kg,
-            palace_path=palace_path,
-            config=MempalaceConfig(),
-            adapter_name=getattr(adapter, "name", name),
-            adapter_version=getattr(adapter, "adapter_version", ""),
-        )
-
-        skip_item = False
-        for result in adapter.ingest(source=ref, palace=ctx):
-            if isinstance(result, SourceItemMetadata):
-                skip_item = False
-                ctx._skip_requested = False
-                existing = collection.get(where={"source_file": result.source_file}, limit=1)
-                metas = (existing or {}).get("metadatas") or []
-                if adapter.is_current(item=result, existing_metadata=metas[0] if metas else None):
-                    ctx.skip_current_item()
-                    skip_item = True
-            elif isinstance(result, DrawerRecord):
-                if skip_item or ctx._skip_requested:
-                    skipped += 1
-                    continue
-                if not dry_run:
-                    ctx.upsert_drawer(result)
-                filed += 1
-        adapter.close()
-
-    return {"name": name, "filed": filed, "skipped": skipped}
+    result_mode = "source" if source_adapter else mode
+    return {
+        "success": True,
+        "kind": "mine",
+        "mode": result_mode,
+        "dry_run": dry_run,
+        "exit_code": 0,
+    }
 
 
 @_restores_palace_env
@@ -390,7 +323,7 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     dry_run = bool(payload.get("dry_run", True))
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Sync — Gitignore-aware drawer prune")
+    print("  MemPalace Sync -- Gitignore-aware drawer prune")
     print(f"{'=' * 55}")
     print(f"  Palace:   {palace_path}")
     if payload.get("wing"):
@@ -431,6 +364,7 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     print(f"  Kept:           {report['kept']}")
     print(f"  Gitignored:     {report['gitignored']}  {removed_suffix}")
     print(f"  Missing:        {report['missing']}  {removed_suffix}")
+    print(f"  Unresolved:     {report['unresolved']}  (kept)")
     print(f"  No source:      {report['no_source']}  (kept)")
     print(f"  Out of scope:   {report['out_of_scope']}  (kept)")
 
@@ -441,6 +375,17 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
         print(f"\n  {label}:")
         for src, n in top:
             print(f"    {src}  ({n})")
+
+    if report["unresolved"]:
+        print("\n  Unresolved drawers are kept: nothing here could show their source file is gone.")
+        unresolved_sources = report.get("unresolved_by_source") or {}
+        if unresolved_sources:
+            top = sorted(unresolved_sources.items(), key=lambda kv: -kv[1])[:5]
+            for src, n in top:
+                print(f"    {src}  ({n})")
+            rest = len(unresolved_sources) - len(top)
+            if rest:
+                print(f"    and {rest} more source file(s)")
 
     if dry_run:
         if report["gitignored"] + report["missing"] > 0:

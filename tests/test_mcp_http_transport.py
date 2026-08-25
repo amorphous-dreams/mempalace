@@ -133,6 +133,119 @@ def test_statusz_reports_machine_readable_server_and_client_state(http_server, m
         assert mcp._config.palace_path not in json.dumps(payload)
 
 
+def test_statusz_stays_healthy_when_no_integrity_verdict_exists(http_server, monkeypatch):
+    """An absent verdict is not a failed one.
+
+    A palace with no chroma.sqlite3 yet reports ``ok: None``. Collapsing that
+    with ``bool()`` would tell every monitor that a freshly installed server is
+    unhealthy. Only a probe that reported something turns /statusz red: a dirty
+    quick_check, or a probe that failed to run and recorded why.
+    """
+    monkeypatch.setattr(
+        mcp,
+        "_sqlite_integrity_payload",
+        lambda: {"checked": False, "ok": None, "errors": [], "reason": "no quick_check ran"},
+    )
+    port, _ = http_server
+
+    status, body = _get(port, "/statusz", headers={"User-Agent": "codex-test"})
+
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["ok"] is True
+    assert payload["palace"]["sqlite_integrity"]["checked"] is False
+    assert payload["palace"]["sqlite_integrity"]["ok"] is None
+
+
+def test_statusz_stays_healthy_for_a_real_palace_with_no_database(
+    http_server, monkeypatch, tmp_path
+):
+    """End to end: a real empty palace, the real payload, the real endpoint.
+
+    The two tests around this one substitute the payload, so they pin the
+    health expression and nothing else. This one runs the gate against a
+    directory that genuinely has no chroma.sqlite3 and checks what the
+    endpoint publishes.
+    """
+    monkeypatch.setattr(type(mcp._config), "palace_path", property(lambda self: str(tmp_path)))
+    monkeypatch.setattr(mcp, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(mcp, "_selected_backend_name", lambda: "chroma")
+    monkeypatch.setattr(mcp, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(mcp, "_sqlite_integrity_no_verdict_reason", "")
+    port, _ = http_server
+
+    status, body = _get(port, "/statusz", headers={"User-Agent": "codex-test"})
+
+    assert status == 200
+    payload = json.loads(body)
+    integrity = payload["palace"]["sqlite_integrity"]
+    assert integrity["checked"] is False
+    assert integrity["ok"] is None
+    assert "chroma.sqlite3" in integrity["reason"]
+    assert payload["ok"] is True
+
+
+def test_statusz_reports_unhealthy_when_the_payload_has_no_verdict_key(http_server, monkeypatch):
+    """A payload shape without `ok` at all must fail closed, not open.
+
+    All three shapes set the key today, so this pins the default rather than a
+    reachable state: `.get("ok")` alone would answer None and read as healthy.
+    """
+    monkeypatch.setattr(mcp, "_sqlite_integrity_payload", lambda: {"errors": []})
+    port, _ = http_server
+
+    status, body = _get(port, "/statusz", headers={"User-Agent": "codex-test"})
+
+    assert status == 200
+    assert json.loads(body)["ok"] is False
+
+
+def test_statusz_stays_healthy_on_a_non_chroma_backend(http_server, monkeypatch, tmp_path):
+    """#1931's shape reached /statusz as unhealthy until now.
+
+    A non-chroma backend has answered `ok: None` since #1931, and `bool()`
+    turned that into a red endpoint for every such server. This is the case
+    the health flag was already getting wrong, independent of an absent
+    database.
+    """
+    monkeypatch.setattr(type(mcp._config), "palace_path", property(lambda self: str(tmp_path)))
+    monkeypatch.setattr(mcp, "_selected_backend_name", lambda: "qdrant")
+    monkeypatch.setattr(mcp, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(mcp, "_sqlite_integrity_no_verdict_reason", "")
+    port, _ = http_server
+
+    status, body = _get(port, "/statusz", headers={"User-Agent": "codex-test"})
+
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["palace"]["sqlite_integrity"]["ok"] is None
+    assert "qdrant" in payload["palace"]["sqlite_integrity"]["reason"]
+    assert payload["ok"] is True
+
+
+def test_statusz_reports_unhealthy_on_a_dirty_verdict(http_server, monkeypatch):
+    """The case that must still turn /statusz red."""
+    monkeypatch.setattr(
+        mcp,
+        "_sqlite_integrity_payload",
+        lambda: {
+            "checked": True,
+            "ok": False,
+            "errors": ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+        },
+    )
+    port, _ = http_server
+
+    status, body = _get(port, "/statusz", headers={"User-Agent": "codex-test"})
+
+    assert status == 200
+    assert json.loads(body)["ok"] is False
+
+
 def test_unknown_path_404(http_server):
     port, _ = http_server
     assert _post(port, "/nope", {"jsonrpc": "2.0", "id": 1, "method": "ping"})[0] == 404
