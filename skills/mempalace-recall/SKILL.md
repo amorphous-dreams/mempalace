@@ -53,8 +53,10 @@ and violates MemPalace's "memory should feel instant" budget.
 1. On wake-up, if a session-start hook injected `additional_context`,
    honour its wing scoping.
 2. Before responding about people / projects / past events / prior
-   decisions: call `mempalace_search` first. Use `mempalace_kg_query`
-   for relational or time-bound facts.
+   decisions: use `mempalace_kg_query` for known relationships or time-bound
+   facts, `mempalace_search` for source text, or `mempalace_diary_read` for
+   recent agent continuity. Stop when answered; follow the canonical
+   [query guide](https://github.com/MemPalace/mempalace/blob/develop/integrations/shared/recall-protocol.md#retrieve-only-the-context-you-need).
 3. If unsure about a fact: say "let me check the palace" and query.
 4. Return the drawer's **verbatim** text. Never summarize or paraphrase
    stored content — quoting the exact words is the point of the system.
@@ -66,14 +68,14 @@ and violates MemPalace's "memory should feel instant" budget.
    independent/coexisting facts.
 
 The full canonical protocol — shared verbatim with the Cursor recall
-rule and the other integrations — lives in
-[`integrations/shared/recall-protocol.md`](../../integrations/shared/recall-protocol.md).
+rule and the other integrations — is published in the
+[MemPalace repository](https://github.com/MemPalace/mempalace/blob/main/integrations/shared/recall-protocol.md).
 
 ## Tool selection
 
 | You need | Tool |
 |---|---|
-| Find any memory by meaning | `mempalace_search` (start here) |
+| Find any memory by meaning | `mempalace_search` |
 | Relational / time-bound facts about an entity | `mempalace_kg_query` |
 | Replace a single-valued fact | `mempalace_kg_supersede` |
 | The chronological story of an entity | `mempalace_kg_timeline` |
@@ -89,14 +91,15 @@ question — not a system prompt or pasted conversation) plus optional
 agent on the shared hub — or waiting for its reply or patch — use the
 logstream tools (`mempalace_event_append`, `mempalace_event_wait`,
 `mempalace_patch_submit`, `mempalace_artifact_get`), not drawers or
-search. The canonical protocol lives in
-[`integrations/shared/coordination-protocol.md`](../../integrations/shared/coordination-protocol.md).
+search. The canonical protocol is published in the
+[MemPalace repository](https://github.com/MemPalace/mempalace/blob/main/integrations/shared/coordination-protocol.md).
 
 ## Unhappy paths
 
-- **Empty results.** Say the palace has nothing on this; do not invent an
-  answer. Offer to widen the search (drop the `wing` filter) or to file
-  the new information.
+- **Empty results.** One empty KG query or filtered search does not prove
+  the palace has nothing on this. Follow the query guide to check or widen
+  the scope. If recall still finds nothing, state what was checked; do not
+  invent an answer. Offer to file the new information.
 - **MCP error / server down.** Surface the error and suggest the user
   run `mempalace status` or re-run `/mempalace-init`. Never fall back to
   guessing.

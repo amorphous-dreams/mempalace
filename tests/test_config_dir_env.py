@@ -1,9 +1,9 @@
 """MEMPALACE_CONFIG_DIR — the config-directory lever, mirroring MEMPALACE_PALACE_PATH.
 
 A host that embeds mempalace as a sidecar spawns it as a process, so it can pass env and argv and
-nothing else. Without an env lever the config directory hardwires to ~/.mempalace and every spawned
-process reads a user-level config it does not own — carrying backend, collection_name,
-embedding_model, write_routing and ~20 more keys across a boundary the embedding was meant to hold.
+nothing else. The env lever keeps that process from inheriting a user's config directory and its
+backend, collection_name, embedding_model and write_routing settings. The upstream default now
+follows XDG for a fresh install while preserving a detected legacy installation.
 
 These cover the resolution order the docstring promises: explicit arg > env > default.
 """
@@ -42,18 +42,20 @@ def test_explicit_arg_outranks_the_env_var(tmp_path, monkeypatch):
     assert cfg._config_dir == arg_dir
 
 
-def test_unset_env_keeps_the_home_default(monkeypatch):
-    """Absent the env var the directory stands where it always stood — behaviour-preserving."""
+def test_unset_env_uses_the_xdg_default(tmp_path, monkeypatch):
+    """A fresh install without the override follows upstream's XDG config home."""
     monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     cfg = MempalaceConfig()
-    assert cfg._config_dir == type(cfg._config_dir)(os.path.expanduser("~/.mempalace"))
+    assert cfg._config_dir == tmp_path / "mempalace"
 
 
-def test_blank_env_falls_through_to_the_default(monkeypatch):
+def test_blank_env_falls_through_to_the_default(tmp_path, monkeypatch):
     """An exported-but-empty value reads as unset rather than as the current directory."""
     monkeypatch.setenv("MEMPALACE_CONFIG_DIR", "   ")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     cfg = MempalaceConfig()
-    assert cfg._config_dir == type(cfg._config_dir)(os.path.expanduser("~/.mempalace"))
+    assert cfg._config_dir == tmp_path / "mempalace"
 
 
 def test_env_var_expands_a_tilde(monkeypatch):
